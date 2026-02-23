@@ -78,6 +78,8 @@ CLI 入口: main() → argparse 路由到命令函数
 
 ## metadata.yaml 关键字段
 
+- `environment`: 实验环境，含 `machine`（机器名）、`gpu`（GPU 型号）、`notes`
+- `provenance`: 代码溯源，含 `code_repo`、`code_branch`（框架分支）、`code_commit`（commit hash）、`notes`
 - `data`: 字典，key 是逻辑名，value 含 `file`、`format`、`description`
 - `figures`: 字典，key 是图表名，value 含 `file`、`script`、`data_inputs`（引用 data 中的逻辑名）、`description`
 - `status`: `active` / `complete` / `abandoned`

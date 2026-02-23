@@ -162,11 +162,16 @@ def cmd_new(args):
         "purpose": args.purpose or "",
         "tags": tags,
         "status": "active",
+        "environment": {
+            "machine": args.machine or "",
+            "gpu": args.gpu or "",
+            "notes": "",
+        },
         "config": {"custom": {}},
         "provenance": {
             "code_repo": "",
-            "code_version": args.code_version or "",
-            "code_branch": "",
+            "code_branch": args.code_branch or "",
+            "code_commit": args.code_commit or "",
             "notes": "",
         },
         "data": {},
@@ -385,11 +390,19 @@ def cmd_show(args):
     print(f"  创建:   {metadata.get('created', '?')}")
     print(f"  更新:   {metadata.get('updated', '?')}")
 
+    env = metadata.get("environment") or {}
+    if env.get("machine"):
+        print(f"  机器:   {env['machine']}")
+    if env.get("gpu"):
+        print(f"  GPU:    {env['gpu']}")
+    if env.get("notes"):
+        print(f"  环境备注: {env['notes']}")
+
     prov = metadata.get("provenance") or {}
-    if prov.get("code_version"):
-        print(f"  版本:   {prov['code_version']}")
     if prov.get("code_branch"):
         print(f"  分支:   {prov['code_branch']}")
+    if prov.get("code_commit"):
+        print(f"  Commit: {prov['code_commit']}")
 
     config = metadata.get("config") or {}
     config_items = {k: v for k, v in config.items() if k != "custom" or v}
@@ -527,7 +540,10 @@ def main():
     p_new.add_argument("slug", help="实验名称 slug")
     p_new.add_argument("--purpose", help="实验目的")
     p_new.add_argument("--tags", nargs="*", help="标签列表")
-    p_new.add_argument("--code-version", help="代码版本")
+    p_new.add_argument("--code-branch", help="推理框架分支")
+    p_new.add_argument("--code-commit", help="推理框架 commit hash")
+    p_new.add_argument("--machine", help="实验机器名称")
+    p_new.add_argument("--gpu", help="GPU 型号")
 
     # add-data
     p_add_data = sub.add_parser("add-data", help="添加数据文件")

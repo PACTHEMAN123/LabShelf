@@ -8,13 +8,18 @@ purpose: "{purpose}"
 tags: {tags}
 status: "{status}"
 
+environment:              # 实验环境
+  machine: "{machine}"
+  gpu: "{gpu}"
+  notes: ""
+
 config:                   # 实验配置（自由填写）
   custom: {{}}
 
 provenance:               # 代码溯源
   code_repo: ""
-  code_version: "{code_version}"
-  code_branch: ""
+  code_branch: "{code_branch}"
+  code_commit: "{code_commit}"
   notes: ""
 
 data: {{}}                  # 数据注册表（逻辑名 → 文件）

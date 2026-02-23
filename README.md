@@ -21,7 +21,10 @@ pip install pyyaml matplotlib
 python3 alloscale.py new moe-routing-latency \
   --purpose "测量 MoE 层在不同 expert 数量下的 routing 延迟" \
   --tags routing latency moe \
-  --code-version abc1234
+  --code-branch feature/moe-split \
+  --code-commit abc1234 \
+  --machine node-01 \
+  --gpu A100-80G
 
 # 2. 添加数据文件
 python3 alloscale.py add-data moe-routing ~/results/latency_log.json \
@@ -95,12 +98,17 @@ purpose: "测量 MoE 层在不同 expert 数量下的 routing 延迟"
 tags: [routing, latency, moe]
 status: "active"          # active / complete / abandoned
 
+environment:              # 实验环境
+  machine: "node-01"
+  gpu: "A100-80G"
+
 config:                   # 实验配置（自由填写）
   num_experts: [8, 16, 32]
   num_gpus: 4
 
 provenance:               # 代码溯源
-  code_version: "abc1234"
+  code_branch: "feature/moe-split"
+  code_commit: "abc1234"
 
 data:                     # 数据注册表（逻辑名 → 文件）
   latency_log:
