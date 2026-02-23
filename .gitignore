@@ -27,4 +27,4 @@ Thumbs.db
 experiments/*
 
 # catalog 由工具自动生成
-# catalog.yaml
+catalog.yaml

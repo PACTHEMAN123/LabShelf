@@ -8,6 +8,8 @@
   add-data <exp> <file>              拷贝数据文件并注册到 metadata
   add-script <exp> <fig-name>        生成可视化脚本骨架并注册溯源关系
   plot <exp> [fig-name]              运行可视化脚本生成图表
+  add-other <exp> <other-name>       生成处理脚本骨架并注册溯源关系
+  run-other <exp> [other-name]       运行处理脚本生成输出
   list [--tag TAG] [--status STATUS] 列出实验
   show <exp>                         显示实验详情
   info <exp>                         显示 数据→脚本→图表 溯源图
@@ -124,6 +126,7 @@ def _rebuild_catalog_data():
             "created": meta.get("created", ""),
             "data_count": len(meta.get("data", {}) or {}),
             "figure_count": len(meta.get("figures", {}) or {}),
+            "other_count": len(meta.get("others", {}) or {}),
         }
 
     return catalog
@@ -151,6 +154,7 @@ def cmd_new(args):
     (exp_dir / "data").mkdir(parents=True)
     (exp_dir / "scripts").mkdir(parents=True)
     (exp_dir / "figures").mkdir(parents=True)
+    (exp_dir / "others").mkdir(parents=True)
 
     # 生成 metadata
     now = _now_iso()
@@ -176,6 +180,7 @@ def cmd_new(args):
         },
         "data": {},
         "figures": {},
+        "others": {},
     }
 
     with open(exp_dir / "metadata.yaml", "w", encoding="utf-8") as f:
@@ -233,28 +238,13 @@ def cmd_add_script(args):
     """生成可视化脚本骨架并注册溯源关系。"""
     exp_id, exp_dir = _resolve_experiment(args.exp)
     fig_name = args.fig_name
-    inputs = args.inputs if args.inputs else []
     description = args.desc or fig_name
 
     metadata = _load_metadata(exp_dir)
 
-    # 验证 data_inputs 引用的逻辑名是否存在
-    data_section = metadata.get("data") or {}
-    for inp in inputs:
-        if inp not in data_section:
-            sys.exit(f"错误: 数据 '{inp}' 未注册，请先使用 add-data 注册")
-
     # 读取脚本模板
     template_path = TEMPLATE_DIR / "plot_template.py"
     template = template_path.read_text(encoding="utf-8")
-
-    # 生成 load_data 行
-    load_lines = []
-    for inp in inputs:
-        load_lines.append(f"    {inp} = load_data(exp_dir, metadata, \"{inp}\")")
-    if not load_lines:
-        load_lines.append("    pass  # 无数据输入")
-    load_block = "\n".join(load_lines)
 
     # 确定输出文件名
     config = _load_config()
@@ -266,8 +256,6 @@ def cmd_add_script(args):
         description=description,
         exp_id=exp_id,
         fig_name=fig_name,
-        data_inputs=", ".join(inputs) if inputs else "无",
-        load_lines=load_block,
         output_file=output_file,
     )
 
@@ -282,7 +270,6 @@ def cmd_add_script(args):
     metadata["figures"][fig_name] = {
         "file": f"figures/{output_file}",
         "script": f"scripts/plot_{fig_name}.py",
-        "data_inputs": inputs,
         "description": description,
     }
     _save_metadata(exp_dir, metadata)
@@ -293,7 +280,6 @@ def cmd_add_script(args):
 
     print(f"已创建脚本: {script_path}")
     print(f"  图表名: {fig_name}")
-    print(f"  数据输入: {', '.join(inputs) if inputs else '无'}")
     print(f"  输出: figures/{output_file}")
     print(f"  请编辑脚本添加绘图逻辑")
 
@@ -342,6 +328,99 @@ def cmd_plot(args):
             print(f"  完成: {fig_name}")
 
 
+def cmd_add_other(args):
+    """生成处理脚本骨架并注册溯源关系。"""
+    exp_id, exp_dir = _resolve_experiment(args.exp)
+    other_name = args.other_name
+    ext = args.ext.lstrip(".")
+    description = args.desc or other_name
+
+    metadata = _load_metadata(exp_dir)
+
+    # 读取脚本模板
+    template_path = TEMPLATE_DIR / "other_template.py"
+    template = template_path.read_text(encoding="utf-8")
+
+    # 确定输出文件名
+    output_file = f"{other_name}.{ext}"
+
+    # 填充模板
+    script_content = template.format(
+        description=description,
+        exp_id=exp_id,
+        other_name=other_name,
+        output_file=output_file,
+    )
+
+    # 写入脚本
+    script_path = exp_dir / "scripts" / f"gen_{other_name}.py"
+    script_path.write_text(script_content, encoding="utf-8")
+    script_path.chmod(0o755)
+
+    # 更新 metadata
+    if metadata.get("others") is None:
+        metadata["others"] = {}
+    metadata["others"][other_name] = {
+        "file": f"others/{output_file}",
+        "script": f"scripts/gen_{other_name}.py",
+        "description": description,
+    }
+    _save_metadata(exp_dir, metadata)
+
+    # 更新 catalog
+    catalog = _rebuild_catalog_data()
+    _save_catalog(catalog)
+
+    print(f"已创建脚本: {script_path}")
+    print(f"  输出名: {other_name}")
+    print(f"  输出: others/{output_file}")
+    print(f"  请编辑脚本添加处理逻辑")
+
+
+def cmd_run_other(args):
+    """运行处理脚本生成输出。"""
+    exp_id, exp_dir = _resolve_experiment(args.exp)
+    metadata = _load_metadata(exp_dir)
+    others = metadata.get("others") or {}
+
+    if not others:
+        sys.exit(f"错误: 实验 '{exp_id}' 没有注册的 others")
+
+    # 确定要运行哪些
+    if args.other_name:
+        if args.other_name not in others:
+            sys.exit(f"错误: other '{args.other_name}' 未注册")
+        targets = {args.other_name: others[args.other_name]}
+    else:
+        targets = others
+
+    for other_name, other_info in targets.items():
+        script_path = exp_dir / other_info["script"]
+        if not script_path.exists():
+            print(f"  跳过 {other_name}: 脚本不存在 ({script_path})")
+            continue
+
+        print(f"运行: {other_name} ...")
+        result = subprocess.run(
+            [sys.executable, str(script_path)],
+            cwd=str(exp_dir),
+            capture_output=True,
+            text=True,
+        )
+
+        if result.stdout:
+            print(result.stdout.rstrip())
+        if result.returncode != 0:
+            print(f"  错误 (exit {result.returncode}):")
+            if result.stderr:
+                print(f"  {result.stderr.rstrip()}")
+        else:
+            # 更新 metadata 时间戳
+            metadata = _load_metadata(exp_dir)
+            _save_metadata(exp_dir, metadata)
+            print(f"  完成: {other_name}")
+
+
 def cmd_list(args):
     """列出实验（支持过滤）。"""
     if not EXPERIMENTS_DIR.exists():
@@ -371,10 +450,11 @@ def cmd_list(args):
         tags_str = ", ".join(exp.get("tags") or [])
         data_count = len(exp.get("data") or {})
         fig_count = len(exp.get("figures") or {})
+        other_count = len(exp.get("others") or {})
         status = exp.get("status", "?")
         print(f"  [{status:^9s}] {exp['id']}")
         print(f"             {exp.get('purpose', '')}")
-        print(f"             tags: [{tags_str}]  data: {data_count}  figures: {fig_count}")
+        print(f"             tags: [{tags_str}]  data: {data_count}  figures: {fig_count}  others: {other_count}")
         print()
 
 
@@ -425,6 +505,13 @@ def cmd_show(args):
             exists = "✓" if (exp_dir / info["file"]).exists() else "✗"
             print(f"    [{exists}] {name}: {info['file']}")
 
+    others = metadata.get("others") or {}
+    if others:
+        print(f"  其他输出 ({len(others)}):")
+        for name, info in others.items():
+            exists = "✓" if (exp_dir / info["file"]).exists() else "✗"
+            print(f"    [{exists}] {name}: {info['file']}")
+
 
 def cmd_info(args):
     """显示 数据→脚本→图表 溯源图。"""
@@ -435,10 +522,10 @@ def cmd_info(args):
     print()
 
     figures = metadata.get("figures") or {}
-    data_section = metadata.get("data") or {}
+    others = metadata.get("others") or {}
 
-    if not figures:
-        print("  暂无注册的图表")
+    if not figures and not others:
+        print("  暂无注册的图表或其他输出")
         return
 
     for fig_name, fig_info in figures.items():
@@ -447,17 +534,18 @@ def cmd_info(args):
 
         print(f"  [{fig_exists}] {fig_info['file']}")
         print(f"    └── [{script_exists}] {fig_info['script']}")
-
-        inputs = fig_info.get("data_inputs") or []
-        for i, inp in enumerate(inputs):
-            connector = "└" if i == len(inputs) - 1 else "├"
-            data_info = data_section.get(inp, {})
-            data_file = data_info.get("file", f"(未注册: {inp})")
-            data_exists = "✓" if data_info and (exp_dir / data_file).exists() else "✗"
-            print(f"        {connector}── [{data_exists}] {data_file}  ({inp})")
-
         if fig_info.get("description"):
             print(f"        描述: {fig_info['description']}")
+        print()
+
+    for other_name, other_info in others.items():
+        other_exists = "✓" if (exp_dir / other_info["file"]).exists() else "✗"
+        script_exists = "✓" if (exp_dir / other_info["script"]).exists() else "✗"
+
+        print(f"  [{other_exists}] {other_info['file']}")
+        print(f"    └── [{script_exists}] {other_info['script']}")
+        if other_info.get("description"):
+            print(f"        描述: {other_info['description']}")
         print()
 
 
@@ -495,16 +583,17 @@ def cmd_validate(args):
             if not file_path.exists():
                 issues.append(f"数据文件缺失: {info['file']} ({name})")
 
-        # 检查 figures 文件和脚本
+        # 检查 figures 脚本
         for name, info in (metadata.get("figures") or {}).items():
             script_path = exp_dir / info["script"]
             if not script_path.exists():
                 issues.append(f"脚本缺失: {info['script']} ({name})")
 
-            # 检查 data_inputs 引用
-            for inp in (info.get("data_inputs") or []):
-                if inp not in (metadata.get("data") or {}):
-                    issues.append(f"图表 '{name}' 引用了未注册的数据: {inp}")
+        # 检查 others 脚本
+        for name, info in (metadata.get("others") or {}).items():
+            script_path = exp_dir / info["script"]
+            if not script_path.exists():
+                issues.append(f"脚本缺失: {info['script']} ({name})")
 
         # 检查必填字段
         if not metadata.get("id"):
@@ -557,13 +646,24 @@ def main():
     p_add_script = sub.add_parser("add-script", help="创建可视化脚本")
     p_add_script.add_argument("exp", help="实验 ID（支持模糊匹配）")
     p_add_script.add_argument("fig_name", help="图表名称")
-    p_add_script.add_argument("--inputs", nargs="*", help="数据输入（逻辑名列表）")
     p_add_script.add_argument("--desc", help="图表描述")
 
     # plot
     p_plot = sub.add_parser("plot", help="运行可视化脚本")
     p_plot.add_argument("exp", help="实验 ID")
     p_plot.add_argument("fig_name", nargs="?", help="图表名称（省略则运行所有）")
+
+    # add-other
+    p_add_other = sub.add_parser("add-other", help="创建处理脚本")
+    p_add_other.add_argument("exp", help="实验 ID（支持模糊匹配）")
+    p_add_other.add_argument("other_name", help="输出名称")
+    p_add_other.add_argument("--ext", required=True, help="输出文件扩展名（如 json, csv, txt）")
+    p_add_other.add_argument("--desc", help="输出描述")
+
+    # run-other
+    p_run_other = sub.add_parser("run-other", help="运行处理脚本")
+    p_run_other.add_argument("exp", help="实验 ID")
+    p_run_other.add_argument("other_name", nargs="?", help="输出名称（省略则运行所有）")
 
     # list
     p_list = sub.add_parser("list", help="列出实验")
@@ -596,6 +696,8 @@ def main():
         "add-data": cmd_add_data,
         "add-script": cmd_add_script,
         "plot": cmd_plot,
+        "add-other": cmd_add_other,
+        "run-other": cmd_run_other,
         "list": cmd_list,
         "show": cmd_show,
         "info": cmd_info,

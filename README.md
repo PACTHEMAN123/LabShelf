@@ -18,34 +18,40 @@ pip install pyyaml matplotlib
 
 ```bash
 # 1. 创建新实验
-python3 labshelf.py new moe-routing-latency \
-  --purpose "测量 MoE 层在不同 expert 数量下的 routing 延迟" \
-  --tags routing latency moe \
-  --code-branch feature/moe-split \
-  --code-commit abc1234 \
-  --machine node-01 \
-  --gpu A100-80G
+python3 labshelf.py new <slug> \
+  --purpose "<实验目的>" \
+  --tags <tag1> <tag2> \
+  --code-branch <branch> \
+  --code-commit <commit> \
+  --machine <machine> \
+  --gpu <gpu>
 
 # 2. 添加数据文件
-python3 labshelf.py add-data moe-routing ~/results/latency_log.json \
-  --name latency_log \
-  --desc "Per-token routing latency"
+python3 labshelf.py add-data <exp> <file> \
+  --name <logical-name> \
+  --desc "<数据描述>"
 
 # 3. 创建可视化脚本
-python3 labshelf.py add-script moe-routing latency_cdf \
-  --inputs latency_log \
-  --desc "延迟 CDF 分布图"
+python3 labshelf.py add-script <exp> <fig-name> \
+  --desc "<图表描述>"
 
 # 4. 编辑生成的脚本，填入绘图逻辑
-# vim experiments/2026-02-23_moe-routing-latency/scripts/plot_latency_cdf.py
+#    脚本中通过 load_data(exp_dir, metadata, "逻辑名") 加载所需数据
 
 # 5. 运行绘图
-python3 labshelf.py plot moe-routing latency_cdf
+python3 labshelf.py plot <exp> [<fig-name>]
 
-# 6. 查看实验
-python3 labshelf.py list --tag routing
-python3 labshelf.py show moe-routing
-python3 labshelf.py info moe-routing
+# 6. 创建处理脚本
+python3 labshelf.py add-other <exp> <other-name> --ext <ext> \
+  --desc "<输出描述>"
+
+# 7. 运行处理脚本
+python3 labshelf.py run-other <exp> [<other-name>]
+
+# 8. 查看实验
+python3 labshelf.py list [--tag <tag>] [--status <status>]
+python3 labshelf.py show <exp>
+python3 labshelf.py info <exp>
 ```
 
 ## 命令参考
@@ -56,13 +62,15 @@ python3 labshelf.py info moe-routing
 | `add-data <exp> <file>` | 拷贝数据文件并注册到 metadata |
 | `add-script <exp> <fig-name>` | 生成可视化脚本骨架并注册溯源关系 |
 | `plot <exp> [fig-name]` | 运行可视化脚本生成图表 |
+| `add-other <exp> <other-name>` | 生成处理脚本骨架并注册溯源关系 |
+| `run-other <exp> [other-name]` | 运行处理脚本生成输出 |
 | `list [--tag TAG] [--status STATUS]` | 列出实验（支持过滤） |
 | `show <exp>` | 显示实验详情 |
-| `info <exp>` | 显示 数据→脚本→图表 溯源图 |
+| `info <exp>` | 显示 脚本→图表 溯源图 |
 | `rebuild-catalog` | 重建全局索引 catalog.yaml |
 | `validate [exp]` | 检查文件完整性 |
 
-所有接受 `<exp>` 参数的命令都支持模糊匹配——输入 `moe-routing` 即可匹配 `2026-02-23_moe-routing-latency`。
+所有接受 `<exp>` 参数的命令都支持模糊匹配——输入子串即可匹配完整实验 ID。
 
 ## 目录结构
 
@@ -73,7 +81,8 @@ LabShelf/
 ├── catalog.yaml                          # 自动生成的索引（勿手动编辑）
 ├── templates/
 │   ├── metadata.yaml                     # 新实验元数据模板
-│   └── plot_template.py                  # 可视化脚本骨架
+│   ├── plot_template.py                  # 可视化脚本骨架
+│   └── other_template.py                 # 处理脚本骨架
 ├── scripts/
 │   └── shared/
 │       ├── loaders.py                    # 统一数据加载
@@ -82,8 +91,9 @@ LabShelf/
     └── YYYY-MM-DD_<slug>/                # 每个实验一个目录
         ├── metadata.yaml                 # 元数据（唯一真相源）
         ├── data/                         # 原始数据
-        ├── scripts/                      # 可视化脚本
-        └── figures/                      # 生成的图表
+        ├── scripts/                      # 可视化/处理脚本
+        ├── figures/                      # 生成的图表
+        └── others/                       # 其他输出
 ```
 
 ## 元数据结构
@@ -91,37 +101,41 @@ LabShelf/
 每个实验的 `metadata.yaml` 包含：
 
 ```yaml
-id: "2026-02-23_moe-routing-latency"
-created: "2026-02-23T14:30:00"
-updated: "2026-02-23T16:45:00"
-purpose: "测量 MoE 层在不同 expert 数量下的 routing 延迟"
-tags: [routing, latency, moe]
+id: "YYYY-MM-DD_<slug>"
+created: "YYYY-MM-DDTHH:MM:SS"
+updated: "YYYY-MM-DDTHH:MM:SS"
+purpose: "<实验目的>"
+tags: [<tag1>, <tag2>]
 status: "active"          # active / complete / abandoned
 
 environment:              # 实验环境
-  machine: "node-01"
-  gpu: "A100-80G"
+  machine: "<machine>"
+  gpu: "<gpu>"
 
 config:                   # 实验配置（自由填写）
-  num_experts: [8, 16, 32]
-  num_gpus: 4
+  custom: {}
 
 provenance:               # 代码溯源
-  code_branch: "feature/moe-split"
-  code_commit: "abc1234"
+  code_branch: "<branch>"
+  code_commit: "<commit>"
 
 data:                     # 数据注册表（逻辑名 → 文件）
-  latency_log:
-    file: "data/latency_log.json"
-    format: "json"
-    description: "Per-token routing latency"
+  <logical-name>:
+    file: "data/<filename>"
+    format: "<format>"
+    description: "<描述>"
 
-figures:                  # 数据→脚本→图表 溯源链
-  latency_cdf:
-    file: "figures/latency_cdf.png"
-    script: "scripts/plot_latency_cdf.py"
-    data_inputs: [latency_log]
-    description: "延迟 CDF 分布图"
+figures:                  # 脚本→图表 溯源链
+  <fig-name>:
+    file: "figures/<fig-name>.<fmt>"
+    script: "scripts/plot_<fig-name>.py"
+    description: "<描述>"
+
+others:                   # 脚本→其他输出 溯源链
+  <other-name>:
+    file: "others/<other-name>.<ext>"
+    script: "scripts/gen_<other-name>.py"
+    description: "<描述>"
 ```
 
 ## 支持的数据格式
@@ -134,7 +148,7 @@ figures:                  # 数据→脚本→图表 溯源链
 | SQLite | `.sqlite`, `.db` | 返回 `sqlite3.Connection` |
 | Nsight | `.nsys-rep` | 返回文件路径（需 nsys 工具链处理） |
 
-在可视化脚本中使用 `load_data(exp_dir, metadata, "逻辑名")` 自动加载。
+在脚本中使用 `load_data(exp_dir, metadata, "逻辑名")` 自动加载。
 
 ## 设计原则
 
@@ -142,4 +156,5 @@ figures:                  # 数据→脚本→图表 溯源链
 - **YAML 优先**：支持注释和多行文本，适合手动编辑
 - **扁平列表 + 标签**：不做层级分类，用标签过滤
 - **每个实验自包含**：可直接打包分享
+- **脚本绑定实验而非数据**：脚本创建时不绑定特定数据输入，运行时通过 `load_data()` 动态加载所需数据
 - **catalog 自动同步**：从各实验 metadata 汇总，永远不会与实际数据脱节
