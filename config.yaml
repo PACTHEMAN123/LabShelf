@@ -1,0 +1,25 @@
+# AlloScale 全局配置
+# 实验数据管理框架
+
+# 实验目录根路径（相对于项目根目录）
+experiments_dir: "experiments"
+
+# catalog 索引文件路径
+catalog_file: "catalog.yaml"
+
+# 默认实验状态
+default_status: "active"
+
+# 绘图默认配置
+plot:
+  dpi: 150
+  format: "png"
+  style: "seaborn-v0_8-whitegrid"
+
+# 支持的数据格式
+supported_formats:
+  - json
+  - sqlite
+  - nsys-rep
+  - txt
+  - csv
