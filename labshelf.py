@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""AlloScale — 实验数据管理框架 CLI
+"""LabShelf — 实验数据管理框架 CLI
 
-用法: python alloscale.py <command> [options]
+用法: python labshelf.py <command> [options]
 
 命令:
   new <slug>                         创建新实验目录 + 骨架 metadata
@@ -530,8 +530,8 @@ def cmd_validate(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="alloscale",
-        description="AlloScale — 实验数据管理框架",
+        prog="labshelf",
+        description="LabShelf — 实验数据管理框架",
     )
     sub = parser.add_subparsers(dest="command", help="可用命令")
 

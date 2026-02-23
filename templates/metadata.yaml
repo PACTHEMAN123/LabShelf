@@ -1,5 +1,5 @@
 # 实验元数据模板
-# 由 alloscale.py new 自动填充
+# 由 labshelf.py new 自动填充
 
 id: "{id}"
 created: "{created}"

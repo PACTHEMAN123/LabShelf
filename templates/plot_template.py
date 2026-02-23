@@ -6,7 +6,7 @@
 图表: {fig_name}
 数据输入: {data_inputs}
 
-自动生成 by alloscale.py add-script
+自动生成 by labshelf.py add-script
 """
 import sys
 from pathlib import Path
