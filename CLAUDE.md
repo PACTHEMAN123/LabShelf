@@ -30,7 +30,7 @@ experiments/          Experiment data root directory (experiment data files are 
 1. **metadata.yaml is the single source of truth** — All data registration and output provenance are recorded here. catalog.yaml is a derived artifact auto-aggregated from each experiment's metadata.
 2. **Flat experiment list + tag filtering** — No hierarchical categorization to avoid classification disputes.
 3. **Experiment ID = `<slug>`** — No date prefix; each experiment represents a research direction, not a single run.
-4. **Per-entry environment/provenance** — Each data entry independently records machine, GPU, code branch, and commit. Git info is auto-detected.
+4. **Per-entry environment/provenance** — Each data entry independently records environment (free-form text) and inference framework code version (branch, commit). These must be manually specified.
 5. **Scripts decoupled from experiments** — Scripts live in `scripts/` and can be reused across experiments.
 6. **Unified output** — `output/` replaces `figures/` + `others/`, no format restrictions.
 7. **Fuzzy matching** — `_resolve_experiment(query)` supports substring matching.
@@ -46,7 +46,6 @@ Utility functions:
   _load_metadata(exp_dir) → Read experiment metadata.yaml
   _save_metadata(exp_dir, metadata) → Write metadata.yaml (automatically updates the 'updated' timestamp)
   _resolve_experiment(query) → Fuzzy-match experiment ID, returns (exp_id, exp_dir)
-  _auto_detect_git()      → Auto-detect current git branch and commit hash
   _rebuild_catalog_data()    → Scan all experiments to build catalog dict
   _save_catalog(catalog)     → Write catalog.yaml
 
@@ -57,7 +56,7 @@ CLI entry point: main() → argparse routes to command functions
 
 ## metadata.yaml Key Fields
 
-- `data`: Dictionary where key is the logical name and value contains `file`, `description`, `added`, `environment` (machine, gpu), `provenance` (code_branch, code_commit)
+- `data`: Dictionary where key is the logical name and value contains `file`, `description`, `added`, `environment` (free-form string), `provenance` (code_branch, code_commit — refers to the inference framework, not LabShelf)
 - `outputs`: Dictionary where key is the output name and value contains `files` (list), `script`, `inputs` (list of data logical names), `description`, `created`
 - `status`: `active` / `complete` / `abandoned`
 

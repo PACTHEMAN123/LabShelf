@@ -17,7 +17,6 @@
 import argparse
 import datetime
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -84,27 +83,6 @@ def _resolve_experiment(query):
     else:
         sys.exit(f"错误: 未找到匹配 '{query}' 的实验")
 
-
-def _auto_detect_git():
-    """自动获取当前 git branch 和 commit hash。"""
-    result = {"branch": "", "commit": ""}
-    try:
-        branch = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if branch.returncode == 0:
-            result["branch"] = branch.stdout.strip()
-
-        commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if commit.returncode == 0:
-            result["commit"] = commit.stdout.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    return result
 
 
 def _rebuild_catalog_data():
@@ -193,11 +171,6 @@ def cmd_add_data(args):
     # 拷贝文件
     shutil.copy2(str(src), str(dest))
 
-    # 自动检测 git 信息
-    git_info = _auto_detect_git()
-    branch = args.branch if args.branch else git_info["branch"]
-    commit = args.commit if args.commit else git_info["commit"]
-
     # 更新 metadata
     metadata = _load_metadata(exp_dir)
     if metadata.get("data") is None:
@@ -209,21 +182,16 @@ def cmd_add_data(args):
         "added": _now_iso(),
     }
 
-    # 环境信息（有值才写入）
-    env = {}
-    if args.machine:
-        env["machine"] = args.machine
-    if args.gpu:
-        env["gpu"] = args.gpu
-    if env:
-        entry["environment"] = env
+    # 环境描述（自由文本）
+    if args.env:
+        entry["environment"] = args.env
 
-    # 溯源信息（有值才写入）
+    # 推理框架溯源（有值才写入）
     prov = {}
-    if branch:
-        prov["code_branch"] = branch
-    if commit:
-        prov["code_commit"] = commit
+    if args.branch:
+        prov["code_branch"] = args.branch
+    if args.commit:
+        prov["code_commit"] = args.commit
     if prov:
         entry["provenance"] = prov
 
@@ -237,10 +205,12 @@ def cmd_add_data(args):
     print(f"已添加数据: {logical_name}")
     print(f"  文件: {dest}")
     print(f"  实验: {exp_id}")
-    if branch:
-        print(f"  分支: {branch}")
-    if commit:
-        print(f"  Commit: {commit[:12]}")
+    if args.env:
+        print(f"  环境: {args.env}")
+    if args.branch:
+        print(f"  分支: {args.branch}")
+    if args.commit:
+        print(f"  Commit: {args.commit[:12]}")
 
 
 def cmd_add_script(args):
@@ -415,14 +385,8 @@ def cmd_show(args):
             print(f"    [{exists}] {name}: {info['file']}")
             if info.get("description"):
                 print(f"        描述: {info['description']}")
-            env = info.get("environment") or {}
-            if env:
-                parts = []
-                if env.get("machine"):
-                    parts.append(f"机器={env['machine']}")
-                if env.get("gpu"):
-                    parts.append(f"GPU={env['gpu']}")
-                print(f"        环境: {', '.join(parts)}")
+            if info.get("environment"):
+                print(f"        环境: {info['environment']}")
             prov = info.get("provenance") or {}
             if prov:
                 parts = []
@@ -578,10 +542,9 @@ def main():
     p_add_data.add_argument("file", help="数据文件路径")
     p_add_data.add_argument("--name", help="逻辑名（默认取文件名）")
     p_add_data.add_argument("--desc", help="数据描述")
-    p_add_data.add_argument("--machine", help="实验机器名称")
-    p_add_data.add_argument("--gpu", help="GPU 型号")
-    p_add_data.add_argument("--branch", help="代码分支（默认自动检测）")
-    p_add_data.add_argument("--commit", help="代码 commit（默认自动检测）")
+    p_add_data.add_argument("--env", help="实验环境描述（自由文本）")
+    p_add_data.add_argument("--branch", help="推理框架代码分支")
+    p_add_data.add_argument("--commit", help="推理框架代码 commit")
 
     # add-script
     p_add_script = sub.add_parser("add-script", help="创建脚本")
