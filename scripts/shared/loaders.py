@@ -7,8 +7,27 @@ import sqlite3
 from pathlib import Path
 
 
+_EXT_TO_FORMAT = {
+    ".json": "json",
+    ".txt": "txt",
+    ".csv": "csv",
+    ".sqlite": "sqlite",
+    ".db": "sqlite",
+    ".nsys-rep": "nsys-rep",
+}
+
+
+def _detect_format(file_path):
+    """根据文件扩展名推断格式。"""
+    name = Path(file_path).name
+    if name.endswith(".nsys-rep"):
+        return "nsys-rep"
+    suffix = Path(file_path).suffix.lower()
+    return _EXT_TO_FORMAT.get(suffix, "txt")
+
+
 def load_data(exp_dir, metadata, logical_name):
-    """根据 metadata 中的 format 字段自动加载数据。
+    """根据文件扩展名自动加载数据。
 
     Args:
         exp_dir: 实验目录路径 (Path 或 str)
@@ -24,10 +43,11 @@ def load_data(exp_dir, metadata, logical_name):
         raise KeyError(f"数据 '{logical_name}' 未在 metadata.data 中注册")
 
     file_path = exp_dir / entry["file"]
-    fmt = entry.get("format", "").lower()
 
     if not file_path.exists():
         raise FileNotFoundError(f"数据文件不存在: {file_path}")
+
+    fmt = _detect_format(file_path)
 
     loader = _LOADERS.get(fmt)
     if loader is None:

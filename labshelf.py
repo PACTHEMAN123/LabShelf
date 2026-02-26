@@ -6,18 +6,17 @@
 命令:
   new <slug>                         创建新实验目录 + 骨架 metadata
   add-data <exp> <file>              拷贝数据文件并注册到 metadata
-  add-script <exp> <fig-name>        生成可视化脚本骨架并注册溯源关系
-  plot <exp> [fig-name]              运行可视化脚本生成图表
-  add-other <exp> <other-name>       生成处理脚本骨架并注册溯源关系
-  run-other <exp> [other-name]       运行处理脚本生成输出
+  add-script <name>                  在 scripts/ 下创建脚本
+  run <script> <exp>                 运行脚本处理实验数据
   list [--tag TAG] [--status STATUS] 列出实验
   show <exp>                         显示实验详情
-  info <exp>                         显示 数据→脚本→图表 溯源图
+  info <exp>                         显示溯源图
   rebuild-catalog                    重建全局索引 catalog.yaml
   validate [exp]                     检查文件完整性
 """
 import argparse
 import datetime
+import json
 import os
 import shutil
 import subprocess
@@ -30,6 +29,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent
 EXPERIMENTS_DIR = ROOT / "experiments"
+SCRIPTS_DIR = ROOT / "scripts"
 CATALOG_FILE = ROOT / "catalog.yaml"
 CONFIG_FILE = ROOT / "config.yaml"
 TEMPLATE_DIR = ROOT / "templates"
@@ -39,10 +39,6 @@ TEMPLATE_DIR = ROOT / "templates"
 
 def _now_iso():
     return datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-
-
-def _today():
-    return datetime.date.today().strftime("%Y-%m-%d")
 
 
 def _load_config():
@@ -89,22 +85,26 @@ def _resolve_experiment(query):
         sys.exit(f"错误: 未找到匹配 '{query}' 的实验")
 
 
-def _detect_format(file_path):
-    """根据文件扩展名推断格式。"""
-    suffix = Path(file_path).suffix.lower()
-    mapping = {
-        ".json": "json",
-        ".txt": "txt",
-        ".csv": "csv",
-        ".sqlite": "sqlite",
-        ".db": "sqlite",
-        ".nsys-rep": "nsys-rep",
-    }
-    # 处理复合后缀如 .nsys-rep
-    name = Path(file_path).name
-    if name.endswith(".nsys-rep"):
-        return "nsys-rep"
-    return mapping.get(suffix, "txt")
+def _auto_detect_git():
+    """自动获取当前 git branch 和 commit hash。"""
+    result = {"branch": "", "commit": ""}
+    try:
+        branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if branch.returncode == 0:
+            result["branch"] = branch.stdout.strip()
+
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if commit.returncode == 0:
+            result["commit"] = commit.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return result
 
 
 def _rebuild_catalog_data():
@@ -125,8 +125,7 @@ def _rebuild_catalog_data():
             "tags": meta.get("tags", []),
             "created": meta.get("created", ""),
             "data_count": len(meta.get("data", {}) or {}),
-            "figure_count": len(meta.get("figures", {}) or {}),
-            "other_count": len(meta.get("others", {}) or {}),
+            "output_count": len(meta.get("outputs", {}) or {}),
         }
 
     return catalog
@@ -144,43 +143,27 @@ def _save_catalog(catalog):
 def cmd_new(args):
     """创建新实验目录 + 骨架 metadata。"""
     slug = args.slug
-    exp_id = f"{_today()}_{slug}"
-    exp_dir = EXPERIMENTS_DIR / exp_id
+    exp_dir = EXPERIMENTS_DIR / slug
 
     if exp_dir.exists():
         sys.exit(f"错误: 实验目录已存在: {exp_dir}")
 
     # 创建目录结构
     (exp_dir / "data").mkdir(parents=True)
-    (exp_dir / "scripts").mkdir(parents=True)
-    (exp_dir / "figures").mkdir(parents=True)
-    (exp_dir / "others").mkdir(parents=True)
+    (exp_dir / "output").mkdir(parents=True)
 
     # 生成 metadata
     now = _now_iso()
     tags = args.tags if args.tags else []
     metadata = {
-        "id": exp_id,
+        "id": slug,
         "created": now,
         "updated": now,
         "purpose": args.purpose or "",
         "tags": tags,
         "status": "active",
-        "environment": {
-            "machine": args.machine or "",
-            "gpu": args.gpu or "",
-            "notes": "",
-        },
-        "config": {"custom": {}},
-        "provenance": {
-            "code_repo": "",
-            "code_branch": args.code_branch or "",
-            "code_commit": args.code_commit or "",
-            "notes": "",
-        },
         "data": {},
-        "figures": {},
-        "others": {},
+        "outputs": {},
     }
 
     with open(exp_dir / "metadata.yaml", "w", encoding="utf-8") as f:
@@ -190,13 +173,13 @@ def cmd_new(args):
     catalog = _rebuild_catalog_data()
     _save_catalog(catalog)
 
-    print(f"已创建实验: {exp_id}")
+    print(f"已创建实验: {slug}")
     print(f"  目录: {exp_dir}")
     print(f"  metadata: {exp_dir / 'metadata.yaml'}")
 
 
 def cmd_add_data(args):
-    """拷贝数据文件并注册到 metadata。"""
+    """拷贝数据文件并注册到 metadata（per-entry 环境和溯源）。"""
     exp_id, exp_dir = _resolve_experiment(args.exp)
     src = Path(args.file).expanduser().resolve()
 
@@ -210,18 +193,41 @@ def cmd_add_data(args):
     # 拷贝文件
     shutil.copy2(str(src), str(dest))
 
-    # 推断格式
-    fmt = args.format if args.format else _detect_format(src.name)
+    # 自动检测 git 信息
+    git_info = _auto_detect_git()
+    branch = args.branch if args.branch else git_info["branch"]
+    commit = args.commit if args.commit else git_info["commit"]
 
     # 更新 metadata
     metadata = _load_metadata(exp_dir)
     if metadata.get("data") is None:
         metadata["data"] = {}
-    metadata["data"][logical_name] = {
+
+    entry = {
         "file": f"data/{src.name}",
-        "format": fmt,
         "description": args.desc or "",
+        "added": _now_iso(),
     }
+
+    # 环境信息（有值才写入）
+    env = {}
+    if args.machine:
+        env["machine"] = args.machine
+    if args.gpu:
+        env["gpu"] = args.gpu
+    if env:
+        entry["environment"] = env
+
+    # 溯源信息（有值才写入）
+    prov = {}
+    if branch:
+        prov["code_branch"] = branch
+    if commit:
+        prov["code_commit"] = commit
+    if prov:
+        entry["provenance"] = prov
+
+    metadata["data"][logical_name] = entry
     _save_metadata(exp_dir, metadata)
 
     # 更新 catalog
@@ -230,195 +236,127 @@ def cmd_add_data(args):
 
     print(f"已添加数据: {logical_name}")
     print(f"  文件: {dest}")
-    print(f"  格式: {fmt}")
     print(f"  实验: {exp_id}")
+    if branch:
+        print(f"  分支: {branch}")
+    if commit:
+        print(f"  Commit: {commit[:12]}")
 
 
 def cmd_add_script(args):
-    """生成可视化脚本骨架并注册溯源关系。"""
-    exp_id, exp_dir = _resolve_experiment(args.exp)
-    fig_name = args.fig_name
-    description = args.desc or fig_name
-
-    metadata = _load_metadata(exp_dir)
+    """在 scripts/ 下创建脚本（不绑定实验）。"""
+    script_name = args.name
+    description = args.desc or script_name
 
     # 读取脚本模板
-    template_path = TEMPLATE_DIR / "plot_template.py"
+    template_path = TEMPLATE_DIR / "script_template.py"
     template = template_path.read_text(encoding="utf-8")
-
-    # 确定输出文件名
-    config = _load_config()
-    plot_fmt = config.get("plot", {}).get("format", "png")
-    output_file = f"{fig_name}.{plot_fmt}"
 
     # 填充模板
     script_content = template.format(
         description=description,
-        exp_id=exp_id,
-        fig_name=fig_name,
-        output_file=output_file,
     )
 
     # 写入脚本
-    script_path = exp_dir / "scripts" / f"plot_{fig_name}.py"
+    script_path = SCRIPTS_DIR / f"{script_name}.py"
+    if script_path.exists():
+        sys.exit(f"错误: 脚本已存在: {script_path}")
+
     script_path.write_text(script_content, encoding="utf-8")
     script_path.chmod(0o755)
 
-    # 更新 metadata
-    if metadata.get("figures") is None:
-        metadata["figures"] = {}
-    metadata["figures"][fig_name] = {
-        "file": f"figures/{output_file}",
-        "script": f"scripts/plot_{fig_name}.py",
-        "description": description,
-    }
-    _save_metadata(exp_dir, metadata)
-
-    # 更新 catalog
-    catalog = _rebuild_catalog_data()
-    _save_catalog(catalog)
-
     print(f"已创建脚本: {script_path}")
-    print(f"  图表名: {fig_name}")
-    print(f"  输出: figures/{output_file}")
-    print(f"  请编辑脚本添加绘图逻辑")
-
-
-def cmd_plot(args):
-    """运行可视化脚本生成图表。"""
-    exp_id, exp_dir = _resolve_experiment(args.exp)
-    metadata = _load_metadata(exp_dir)
-    figures = metadata.get("figures") or {}
-
-    if not figures:
-        sys.exit(f"错误: 实验 '{exp_id}' 没有注册的图表")
-
-    # 确定要生成哪些图表
-    if args.fig_name:
-        if args.fig_name not in figures:
-            sys.exit(f"错误: 图表 '{args.fig_name}' 未注册")
-        targets = {args.fig_name: figures[args.fig_name]}
-    else:
-        targets = figures
-
-    for fig_name, fig_info in targets.items():
-        script_path = exp_dir / fig_info["script"]
-        if not script_path.exists():
-            print(f"  跳过 {fig_name}: 脚本不存在 ({script_path})")
-            continue
-
-        print(f"运行: {fig_name} ...")
-        result = subprocess.run(
-            [sys.executable, str(script_path)],
-            cwd=str(exp_dir),
-            capture_output=True,
-            text=True,
-        )
-
-        if result.stdout:
-            print(result.stdout.rstrip())
-        if result.returncode != 0:
-            print(f"  错误 (exit {result.returncode}):")
-            if result.stderr:
-                print(f"  {result.stderr.rstrip()}")
-        else:
-            # 更新 metadata 时间戳
-            metadata = _load_metadata(exp_dir)
-            _save_metadata(exp_dir, metadata)
-            print(f"  完成: {fig_name}")
-
-
-def cmd_add_other(args):
-    """生成处理脚本骨架并注册溯源关系。"""
-    exp_id, exp_dir = _resolve_experiment(args.exp)
-    other_name = args.other_name
-    ext = args.ext.lstrip(".")
-    description = args.desc or other_name
-
-    metadata = _load_metadata(exp_dir)
-
-    # 读取脚本模板
-    template_path = TEMPLATE_DIR / "other_template.py"
-    template = template_path.read_text(encoding="utf-8")
-
-    # 确定输出文件名
-    output_file = f"{other_name}.{ext}"
-
-    # 填充模板
-    script_content = template.format(
-        description=description,
-        exp_id=exp_id,
-        other_name=other_name,
-        output_file=output_file,
-    )
-
-    # 写入脚本
-    script_path = exp_dir / "scripts" / f"gen_{other_name}.py"
-    script_path.write_text(script_content, encoding="utf-8")
-    script_path.chmod(0o755)
-
-    # 更新 metadata
-    if metadata.get("others") is None:
-        metadata["others"] = {}
-    metadata["others"][other_name] = {
-        "file": f"others/{output_file}",
-        "script": f"scripts/gen_{other_name}.py",
-        "description": description,
-    }
-    _save_metadata(exp_dir, metadata)
-
-    # 更新 catalog
-    catalog = _rebuild_catalog_data()
-    _save_catalog(catalog)
-
-    print(f"已创建脚本: {script_path}")
-    print(f"  输出名: {other_name}")
-    print(f"  输出: others/{output_file}")
     print(f"  请编辑脚本添加处理逻辑")
 
 
-def cmd_run_other(args):
-    """运行处理脚本生成输出。"""
+def cmd_run(args):
+    """运行脚本处理实验数据，输出到 output/，自动记录溯源。"""
+    script_name = args.script
     exp_id, exp_dir = _resolve_experiment(args.exp)
     metadata = _load_metadata(exp_dir)
-    others = metadata.get("others") or {}
 
-    if not others:
-        sys.exit(f"错误: 实验 '{exp_id}' 没有注册的 others")
-
-    # 确定要运行哪些
-    if args.other_name:
-        if args.other_name not in others:
-            sys.exit(f"错误: other '{args.other_name}' 未注册")
-        targets = {args.other_name: others[args.other_name]}
-    else:
-        targets = others
-
-    for other_name, other_info in targets.items():
-        script_path = exp_dir / other_info["script"]
+    # 定位脚本
+    script_path = SCRIPTS_DIR / f"{script_name}.py"
+    if not script_path.exists():
+        # 尝试加 .py
+        script_path = SCRIPTS_DIR / script_name
         if not script_path.exists():
-            print(f"  跳过 {other_name}: 脚本不存在 ({script_path})")
-            continue
+            sys.exit(f"错误: 脚本不存在: {SCRIPTS_DIR / f'{script_name}.py'}")
 
-        print(f"运行: {other_name} ...")
-        result = subprocess.run(
-            [sys.executable, str(script_path)],
-            cwd=str(exp_dir),
-            capture_output=True,
-            text=True,
-        )
+    # 确定输出名
+    output_name = args.name if args.name else script_path.stem
 
-        if result.stdout:
-            print(result.stdout.rstrip())
-        if result.returncode != 0:
-            print(f"  错误 (exit {result.returncode}):")
-            if result.stderr:
-                print(f"  {result.stderr.rstrip()}")
-        else:
-            # 更新 metadata 时间戳
-            metadata = _load_metadata(exp_dir)
-            _save_metadata(exp_dir, metadata)
-            print(f"  完成: {other_name}")
+    # 确定输入数据
+    data = metadata.get("data") or {}
+    if not data:
+        sys.exit(f"错误: 实验 '{exp_id}' 没有注册的数据")
+
+    if args.inputs:
+        # 指定输入
+        inputs = {}
+        for name in args.inputs:
+            if name not in data:
+                sys.exit(f"错误: 数据 '{name}' 未在实验 '{exp_id}' 中注册")
+            inputs[name] = str(exp_dir / data[name]["file"])
+    else:
+        # 默认使用全部数据
+        inputs = {name: str(exp_dir / info["file"]) for name, info in data.items()}
+
+    # 创建输出目录
+    output_dir = exp_dir / "output" / output_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 构建 JSON 参数
+    run_args = json.dumps({
+        "exp_dir": str(exp_dir),
+        "output_dir": str(output_dir),
+        "inputs": inputs,
+    }, ensure_ascii=False)
+
+    print(f"运行: {script_path.name} → {exp_id}/output/{output_name}")
+
+    result = subprocess.run(
+        [sys.executable, str(script_path), run_args],
+        capture_output=True,
+        text=True,
+    )
+
+    if result.stdout:
+        print(result.stdout.rstrip())
+    if result.returncode != 0:
+        print(f"  错误 (exit {result.returncode}):")
+        if result.stderr:
+            print(f"  {result.stderr.rstrip()}")
+        return
+
+    # 记录输出文件
+    output_files = []
+    if output_dir.exists():
+        for f in sorted(output_dir.iterdir()):
+            if f.is_file():
+                output_files.append(f"output/{output_name}/{f.name}")
+
+    # 更新 metadata
+    metadata = _load_metadata(exp_dir)
+    if metadata.get("outputs") is None:
+        metadata["outputs"] = {}
+    metadata["outputs"][output_name] = {
+        "files": output_files,
+        "script": script_path.name,
+        "inputs": list(inputs.keys()),
+        "description": args.desc or "",
+        "created": _now_iso(),
+    }
+    _save_metadata(exp_dir, metadata)
+
+    # 更新 catalog
+    catalog = _rebuild_catalog_data()
+    _save_catalog(catalog)
+
+    print(f"  完成: {output_name}")
+    if output_files:
+        for f in output_files:
+            print(f"    {f}")
 
 
 def cmd_list(args):
@@ -449,12 +387,11 @@ def cmd_list(args):
     for exp in experiments:
         tags_str = ", ".join(exp.get("tags") or [])
         data_count = len(exp.get("data") or {})
-        fig_count = len(exp.get("figures") or {})
-        other_count = len(exp.get("others") or {})
+        output_count = len(exp.get("outputs") or {})
         status = exp.get("status", "?")
         print(f"  [{status:^9s}] {exp['id']}")
         print(f"             {exp.get('purpose', '')}")
-        print(f"             tags: [{tags_str}]  data: {data_count}  figures: {fig_count}  others: {other_count}")
+        print(f"             tags: [{tags_str}]  data: {data_count}  outputs: {output_count}")
         print()
 
 
@@ -470,82 +407,86 @@ def cmd_show(args):
     print(f"  创建:   {metadata.get('created', '?')}")
     print(f"  更新:   {metadata.get('updated', '?')}")
 
-    env = metadata.get("environment") or {}
-    if env.get("machine"):
-        print(f"  机器:   {env['machine']}")
-    if env.get("gpu"):
-        print(f"  GPU:    {env['gpu']}")
-    if env.get("notes"):
-        print(f"  环境备注: {env['notes']}")
-
-    prov = metadata.get("provenance") or {}
-    if prov.get("code_branch"):
-        print(f"  分支:   {prov['code_branch']}")
-    if prov.get("code_commit"):
-        print(f"  Commit: {prov['code_commit']}")
-
-    config = metadata.get("config") or {}
-    config_items = {k: v for k, v in config.items() if k != "custom" or v}
-    if config_items:
-        print(f"  配置:")
-        for k, v in config_items.items():
-            print(f"    {k}: {v}")
-
     data = metadata.get("data") or {}
     if data:
         print(f"  数据 ({len(data)}):")
         for name, info in data.items():
             exists = "✓" if (exp_dir / info["file"]).exists() else "✗"
-            print(f"    [{exists}] {name}: {info['file']} ({info.get('format', '?')})")
-
-    figures = metadata.get("figures") or {}
-    if figures:
-        print(f"  图表 ({len(figures)}):")
-        for name, info in figures.items():
-            exists = "✓" if (exp_dir / info["file"]).exists() else "✗"
             print(f"    [{exists}] {name}: {info['file']}")
+            if info.get("description"):
+                print(f"        描述: {info['description']}")
+            env = info.get("environment") or {}
+            if env:
+                parts = []
+                if env.get("machine"):
+                    parts.append(f"机器={env['machine']}")
+                if env.get("gpu"):
+                    parts.append(f"GPU={env['gpu']}")
+                print(f"        环境: {', '.join(parts)}")
+            prov = info.get("provenance") or {}
+            if prov:
+                parts = []
+                if prov.get("code_branch"):
+                    parts.append(f"分支={prov['code_branch']}")
+                if prov.get("code_commit"):
+                    parts.append(f"commit={prov['code_commit'][:12]}")
+                print(f"        溯源: {', '.join(parts)}")
 
-    others = metadata.get("others") or {}
-    if others:
-        print(f"  其他输出 ({len(others)}):")
-        for name, info in others.items():
-            exists = "✓" if (exp_dir / info["file"]).exists() else "✗"
-            print(f"    [{exists}] {name}: {info['file']}")
+    outputs = metadata.get("outputs") or {}
+    if outputs:
+        print(f"  输出 ({len(outputs)}):")
+        for name, info in outputs.items():
+            files = info.get("files") or []
+            print(f"    {name}:")
+            print(f"        脚本: {info.get('script', '?')}")
+            print(f"        输入: {', '.join(info.get('inputs') or [])}")
+            if info.get("description"):
+                print(f"        描述: {info['description']}")
+            for f in files:
+                exists = "✓" if (exp_dir / f).exists() else "✗"
+                print(f"        [{exists}] {f}")
 
 
 def cmd_info(args):
-    """显示 数据→脚本→图表 溯源图。"""
+    """显示溯源图: inputs → script → output files。"""
     exp_id, exp_dir = _resolve_experiment(args.exp)
     metadata = _load_metadata(exp_dir)
 
     print(f"溯源图: {exp_id}")
     print()
 
-    figures = metadata.get("figures") or {}
-    others = metadata.get("others") or {}
+    outputs = metadata.get("outputs") or {}
 
-    if not figures and not others:
-        print("  暂无注册的图表或其他输出")
+    if not outputs:
+        print("  暂无注册的输出")
         return
 
-    for fig_name, fig_info in figures.items():
-        fig_exists = "✓" if (exp_dir / fig_info["file"]).exists() else "✗"
-        script_exists = "✓" if (exp_dir / fig_info["script"]).exists() else "✗"
+    for output_name, output_info in outputs.items():
+        script = output_info.get("script", "?")
+        input_names = output_info.get("inputs") or []
+        files = output_info.get("files") or []
 
-        print(f"  [{fig_exists}] {fig_info['file']}")
-        print(f"    └── [{script_exists}] {fig_info['script']}")
-        if fig_info.get("description"):
-            print(f"        描述: {fig_info['description']}")
-        print()
+        # 输入数据
+        for inp in input_names:
+            data_entry = (metadata.get("data") or {}).get(inp)
+            if data_entry:
+                exists = "✓" if (exp_dir / data_entry["file"]).exists() else "✗"
+                print(f"  [{exists}] {data_entry['file']}  ({inp})")
+            else:
+                print(f"  [?] {inp}")
 
-    for other_name, other_info in others.items():
-        other_exists = "✓" if (exp_dir / other_info["file"]).exists() else "✗"
-        script_exists = "✓" if (exp_dir / other_info["script"]).exists() else "✗"
+        # 脚本
+        script_path = SCRIPTS_DIR / script
+        script_exists = "✓" if script_path.exists() else "✗"
+        print(f"    └── [{script_exists}] scripts/{script}")
 
-        print(f"  [{other_exists}] {other_info['file']}")
-        print(f"    └── [{script_exists}] {other_info['script']}")
-        if other_info.get("description"):
-            print(f"        描述: {other_info['description']}")
+        # 输出文件
+        for f in files:
+            f_exists = "✓" if (exp_dir / f).exists() else "✗"
+            print(f"          └── [{f_exists}] {f}")
+
+        if output_info.get("description"):
+            print(f"        描述: {output_info['description']}")
         print()
 
 
@@ -583,17 +524,18 @@ def cmd_validate(args):
             if not file_path.exists():
                 issues.append(f"数据文件缺失: {info['file']} ({name})")
 
-        # 检查 figures 脚本
-        for name, info in (metadata.get("figures") or {}).items():
-            script_path = exp_dir / info["script"]
-            if not script_path.exists():
-                issues.append(f"脚本缺失: {info['script']} ({name})")
-
-        # 检查 others 脚本
-        for name, info in (metadata.get("others") or {}).items():
-            script_path = exp_dir / info["script"]
-            if not script_path.exists():
-                issues.append(f"脚本缺失: {info['script']} ({name})")
+        # 检查 outputs
+        for name, info in (metadata.get("outputs") or {}).items():
+            # 检查脚本
+            script = info.get("script", "")
+            if script:
+                script_path = SCRIPTS_DIR / script
+                if not script_path.exists():
+                    issues.append(f"脚本缺失: scripts/{script} ({name})")
+            # 检查输出文件
+            for f in (info.get("files") or []):
+                if not (exp_dir / f).exists():
+                    issues.append(f"输出文件缺失: {f} ({name})")
 
         # 检查必填字段
         if not metadata.get("id"):
@@ -629,41 +571,30 @@ def main():
     p_new.add_argument("slug", help="实验名称 slug")
     p_new.add_argument("--purpose", help="实验目的")
     p_new.add_argument("--tags", nargs="*", help="标签列表")
-    p_new.add_argument("--code-branch", help="推理框架分支")
-    p_new.add_argument("--code-commit", help="推理框架 commit hash")
-    p_new.add_argument("--machine", help="实验机器名称")
-    p_new.add_argument("--gpu", help="GPU 型号")
 
     # add-data
     p_add_data = sub.add_parser("add-data", help="添加数据文件")
     p_add_data.add_argument("exp", help="实验 ID（支持模糊匹配）")
     p_add_data.add_argument("file", help="数据文件路径")
     p_add_data.add_argument("--name", help="逻辑名（默认取文件名）")
-    p_add_data.add_argument("--format", help="数据格式（默认自动检测）")
     p_add_data.add_argument("--desc", help="数据描述")
+    p_add_data.add_argument("--machine", help="实验机器名称")
+    p_add_data.add_argument("--gpu", help="GPU 型号")
+    p_add_data.add_argument("--branch", help="代码分支（默认自动检测）")
+    p_add_data.add_argument("--commit", help="代码 commit（默认自动检测）")
 
     # add-script
-    p_add_script = sub.add_parser("add-script", help="创建可视化脚本")
-    p_add_script.add_argument("exp", help="实验 ID（支持模糊匹配）")
-    p_add_script.add_argument("fig_name", help="图表名称")
-    p_add_script.add_argument("--desc", help="图表描述")
+    p_add_script = sub.add_parser("add-script", help="创建脚本")
+    p_add_script.add_argument("name", help="脚本名称")
+    p_add_script.add_argument("--desc", help="脚本描述")
 
-    # plot
-    p_plot = sub.add_parser("plot", help="运行可视化脚本")
-    p_plot.add_argument("exp", help="实验 ID")
-    p_plot.add_argument("fig_name", nargs="?", help="图表名称（省略则运行所有）")
-
-    # add-other
-    p_add_other = sub.add_parser("add-other", help="创建处理脚本")
-    p_add_other.add_argument("exp", help="实验 ID（支持模糊匹配）")
-    p_add_other.add_argument("other_name", help="输出名称")
-    p_add_other.add_argument("--ext", required=True, help="输出文件扩展名（如 json, csv, txt）")
-    p_add_other.add_argument("--desc", help="输出描述")
-
-    # run-other
-    p_run_other = sub.add_parser("run-other", help="运行处理脚本")
-    p_run_other.add_argument("exp", help="实验 ID")
-    p_run_other.add_argument("other_name", nargs="?", help="输出名称（省略则运行所有）")
+    # run
+    p_run = sub.add_parser("run", help="运行脚本处理实验数据")
+    p_run.add_argument("script", help="脚本名称")
+    p_run.add_argument("exp", help="实验 ID（支持模糊匹配）")
+    p_run.add_argument("--inputs", nargs="*", help="输入数据逻辑名（默认全部）")
+    p_run.add_argument("--name", help="输出名称（默认用脚本名）")
+    p_run.add_argument("--desc", help="输出描述")
 
     # list
     p_list = sub.add_parser("list", help="列出实验")
@@ -695,9 +626,7 @@ def main():
         "new": cmd_new,
         "add-data": cmd_add_data,
         "add-script": cmd_add_script,
-        "plot": cmd_plot,
-        "add-other": cmd_add_other,
-        "run-other": cmd_run_other,
+        "run": cmd_run,
         "list": cmd_list,
         "show": cmd_show,
         "info": cmd_info,
