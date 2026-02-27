@@ -5,7 +5,7 @@
 
 命令:
   new <slug>                         创建新实验目录 + 骨架 metadata
-  add-data <exp> <file>              拷贝数据文件并注册到 metadata
+  add-data <exp> <file>              拷贝数据文件/文件夹并注册到 metadata
   add-script <name>                  在 scripts/ 下创建脚本
   run <script> <exp>                 运行脚本处理实验数据
   list [--tag TAG] [--status STATUS] 列出实验
@@ -157,19 +157,24 @@ def cmd_new(args):
 
 
 def cmd_add_data(args):
-    """拷贝数据文件并注册到 metadata（per-entry 环境和溯源）。"""
+    """拷贝数据文件或文件夹并注册到 metadata（per-entry 环境和溯源）。"""
     exp_id, exp_dir = _resolve_experiment(args.exp)
     src = Path(args.file).expanduser().resolve()
 
     if not src.exists():
-        sys.exit(f"错误: 源文件不存在: {src}")
+        sys.exit(f"错误: 源路径不存在: {src}")
 
     # 确定逻辑名和目标路径
     logical_name = args.name if args.name else src.stem
     dest = exp_dir / "data" / src.name
 
-    # 拷贝文件
-    shutil.copy2(str(src), str(dest))
+    # 拷贝文件或文件夹
+    if src.is_dir():
+        if dest.exists():
+            shutil.rmtree(str(dest))
+        shutil.copytree(str(src), str(dest))
+    else:
+        shutil.copy2(str(src), str(dest))
 
     # 更新 metadata
     metadata = _load_metadata(exp_dir)
@@ -203,7 +208,7 @@ def cmd_add_data(args):
     _save_catalog(catalog)
 
     print(f"已添加数据: {logical_name}")
-    print(f"  文件: {dest}")
+    print(f"  路径: {dest}")
     print(f"  实验: {exp_id}")
     if args.env:
         print(f"  环境: {args.env}")
@@ -537,9 +542,9 @@ def main():
     p_new.add_argument("--tags", nargs="*", help="标签列表")
 
     # add-data
-    p_add_data = sub.add_parser("add-data", help="添加数据文件")
+    p_add_data = sub.add_parser("add-data", help="添加数据文件或文件夹")
     p_add_data.add_argument("exp", help="实验 ID（支持模糊匹配）")
-    p_add_data.add_argument("file", help="数据文件路径")
+    p_add_data.add_argument("file", help="数据文件或文件夹路径")
     p_add_data.add_argument("--name", help="逻辑名（默认取文件名）")
     p_add_data.add_argument("--desc", help="数据描述")
     p_add_data.add_argument("--env", help="实验环境描述（自由文本）")
