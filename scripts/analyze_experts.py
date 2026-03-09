@@ -6,7 +6,7 @@ Produces per-layer analysis folders with:
 2. Stacked area chart of expert activation over time/step
 3. EPLB algorithm comparison — imbalance ratio with threshold-triggered re-placement
 
-Each analysis: 2 x-axis modes (time, step) × 3 filter modes (prefill, decode, mix) = 6 figures
+Each analysis: 1 x-axis mode (step) × 3 filter modes (prefill, decode, mix) = 3 figures
 
 自动生成 by labshelf.py add-script
 """
@@ -21,8 +21,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-from matplotlib.ticker import MaxNLocator
-from collections import defaultdict
 from pathlib import Path
 import warnings
 warnings.filterwarnings("ignore")
@@ -37,6 +35,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 IMBALANCE_THRESHOLDS = [1.5, 2.0]  # 比较不同阈值
 HEATMAP_FREQ_CAP_PERCENTILE = 97  # clamp heatmap color at this percentile for visibility
 STEP_RANGE = (1000, 1100)  # (m, n) 只取第 m~n 条记录，None 表示全部。例: STEP_RANGE = (100, 500)
+# STEP_RANGE = None
 
 # ──────────────────────────────────────────────────────────
 # Data loading
@@ -280,8 +279,8 @@ EPLB_ALGORITHMS = {
 }
 
 
-def compute_placement_quality(counts, permutation, num_groups=None):
-    """max_group_load / mean_group_load. Lower = better."""
+def compute_group_loads(counts, permutation, num_groups=None):
+    """Compute per-group token loads given expert counts and permutation."""
     n = len(counts)
     if num_groups is None:
         num_groups = max(1, int(np.sqrt(n)))
@@ -290,6 +289,12 @@ def compute_placement_quality(counts, permutation, num_groups=None):
     for expert_idx in range(n):
         group_id = min(permutation[expert_idx] // group_size, num_groups - 1)
         group_loads[group_id] += counts[expert_idx]
+    return group_loads
+
+
+def compute_placement_quality(counts, permutation, num_groups=None):
+    """max_group_load / mean_group_load. Lower = better."""
+    group_loads = compute_group_loads(counts, permutation, num_groups)
     mean_load = group_loads.mean()
     if mean_load == 0:
         return 1.0
@@ -394,7 +399,6 @@ def plot_imbalance_compare(filtered_records, x_mode, filter_mode, layer_idx, out
     savefig(fig, os.path.join(output_dir, fname))
 
 
-
 # ──────────────────────────────────────────────────────────
 # HTML index
 # ──────────────────────────────────────────────────────────
@@ -430,7 +434,7 @@ summary { cursor: pointer; font-weight: bold; font-size: 16px; color: #2c3e50; }
         ("heatmap", "1. Expert Activation Heatmap"),
         ("stacked", "2. Stacked Area Chart"),
     ]
-    x_modes = ["time", "step"]
+    x_modes = ["step"]
     filter_modes = ["decode", "prefill", "mix"]
 
     for idx in layer_indices:
@@ -507,21 +511,31 @@ def main():
     print(f"Output dir: {output_dir}")
     print("=" * 60)
 
-    X_MODES = ["time", "step"]
+    X_MODES = ["step"]
     FILTER_MODES = ["decode", "prefill", "mix"]
+
+    # Parse all layers
+    all_records = {}
+    for layer_idx in layer_indices:
+        filepath = layer_entries[layer_idx]
+        full = parse_log_file(filepath)
+        if STEP_RANGE is not None:
+            m, n = STEP_RANGE
+            all_records[layer_idx] = full[m:n]
+        else:
+            all_records[layer_idx] = full
 
     for layer_idx in layer_indices:
         filepath = layer_entries[layer_idx]
+        records = all_records[layer_idx]
 
         print(f"\n{'='*60}")
         print(f"Processing Layer {layer_idx}: {filepath}")
         print(f"{'='*60}")
 
-        records = parse_log_file(filepath)
         if STEP_RANGE is not None:
             m, n = STEP_RANGE
-            records = records[m:n]
-            print(f"  Loaded {len(records)} records (step range [{m}, {n}))")
+            print(f"  Window [{m}, {n}): {len(records)} records")
         print(f"  Total: {len(records)} records "
               f"({sum(1 for r in records if r['is_decode'])} decode, "
               f"{sum(1 for r in records if not r['is_decode'])} prefill)")
@@ -535,7 +549,6 @@ def main():
                 if len(filtered) < 2:
                     print(f"  [SKIP] {x_mode}/{filter_mode}: only {len(filtered)} records")
                     continue
-
                 print(f"\n  --- {x_mode} / {filter_mode} ({len(filtered)} records) ---")
 
                 # 1. Heatmap
@@ -561,7 +574,7 @@ def main():
         print(f"    最不活跃专家: Expert {least_active} ({total_per_expert[least_active]:.0f} tokens)")
         print(f"    输出目录: {layer_dir}")
 
-    # Generate summary index
+    # Generate index
     generate_index(str(output_dir), layer_indices)
     print(f"\n{'='*60}")
     print(f"完成: {output_dir}")
