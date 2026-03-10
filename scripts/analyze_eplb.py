@@ -2,9 +2,9 @@
 """EPLB Simulation Analysis Pipeline
 ====================================
 Produces per-layer and system-level EPLB comparison plots:
-1. Per-layer: No EPLB vs Static EPLB vs Dynamic EPLB(k) — time, utilization, memory
+1. Per-layer: No EPLB vs Static vs Dynamic (LoadBalance) vs Dynamic (MinAct)
 2. System-level: same comparison aggregated across all layers
-3. Win-rate comparison: bar chart showing how often each strategy wins per metric
+3. Relative change vs Static: separate charts for LoadBalance and MinAct strategies
 
 Each analysis: 1 x-axis mode (step) × 3 filter modes (prefill, decode, mix)
 
@@ -17,6 +17,7 @@ import re
 import ast
 import shutil
 import heapq
+from multiprocessing import Pool, cpu_count
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -36,8 +37,15 @@ EPLB_INTERVALS = [1, 2, 5, 200, 1000]  # compare different EPLB intervals
 HIDDEN_SIZE = 5120
 MOE_INTERMEDIATE_SIZE = 1536
 EXTRA_SLOTS_PER_RANK = 2  # slots_per_rank = local_experts + extra
-EMA_DECAY = 0.5           # EMA blend: decay * history + (1-decay) * current_window
-GPU_TFLOPS = 990          # bf16 peak TFLOPS (e.g. H100=990, A100=312)
+EPMOE_LATENCY = {
+    "active_experts": list(range(1, 33)),
+    "latency_ms": [
+        0.327536,0.328576,0.329600,0.327296,0.354256,0.33784,0.329968,0.325616,
+        0.326016,0.363072,0.405536,0.411616,0.433280,0.480448,0.516096,0.508736,
+        0.549792,0.542576,0.575744,0.634432,0.637968,0.652320,0.691952,0.687616,
+        0.719296,0.741088,0.743392,0.840064,0.8702912,0.827024,0.862720,0.913840
+    ],
+}
 STEP_RANGE = (1000, 10000)  # (m, n) 只取第 m~n 条记录，None 表示全部
 # STEP_RANGE = None
 
@@ -162,6 +170,224 @@ def compute_group_loads_replica(counts, rank_experts, replica_counts):
     return group_loads
 
 
+def load_latency_table():
+    """Return an interpolation function: active_experts -> latency_ms from hardcoded data."""
+    xs = np.array(EPMOE_LATENCY["active_experts"], dtype=float)
+    ys = np.array(EPMOE_LATENCY["latency_ms"], dtype=float)
+
+    def latency_fn(n_active):
+        if n_active <= 0:
+            return 0.0
+        if n_active >= xs[-1]:
+            return float(ys[-1])
+        return float(np.interp(n_active, xs, ys))
+    return latency_fn
+
+
+def compute_rank_active_counts(counts, rank_experts):
+    """Count active expert slots per rank. Each slot with counts[eid] > 0 is active."""
+    active = np.zeros(len(rank_experts), dtype=int)
+    for g in range(len(rank_experts)):
+        for eid in rank_experts[g]:
+            if counts[eid] > 0:
+                active[g] += 1
+    return active
+
+
+def eplb_replica_placement_window(per_step_counts, num_groups=None, slots_per_rank=None):
+    """EPLB placement optimized for a window of steps.
+
+    Minimizes sum of per-step max-group-loads (the true bottleneck metric),
+    rather than just balancing aggregate counts.
+
+    Step 1: Replication based on aggregate counts (greedy, same as single-step).
+    Step 2: Initial placement via LPT on aggregate.
+    Step 3: Hill-climb — pairwise swap replicas between ranks, accept if
+            sum_t max_g(load_g(t)) decreases. Each swap evaluation is O(k)
+            using numpy vectorization.
+
+    Returns (rank_experts, replica_counts).
+    """
+    n = len(per_step_counts[0])
+    k = len(per_step_counts)
+    if num_groups is None:
+        num_groups = max(1, int(np.sqrt(n)))
+    if slots_per_rank is None:
+        slots_per_rank = (n + num_groups - 1) // num_groups
+
+    # Counts matrix: (k, n)
+    counts_matrix = np.array(per_step_counts, dtype=np.float64)
+    agg = counts_matrix.sum(axis=0)
+
+    # Step 1: Replication — greedy on aggregate
+    total_slots = num_groups * slots_per_rank
+    replica_counts = np.ones(n, dtype=int)
+    if total_slots > n:
+        heap = [(-float(agg[i]), i) for i in range(n)]
+        heapq.heapify(heap)
+        assigned = n
+        while assigned < total_slots:
+            neg_load, eid = heapq.heappop(heap)
+            replica_counts[eid] += 1
+            heapq.heappush(heap, (-float(agg[eid]) / replica_counts[eid], eid))
+            assigned += 1
+
+    # Step 2: Initial placement via LPT on aggregate
+    replicas = []
+    for eid in range(n):
+        slot_load = float(agg[eid]) / replica_counts[eid]
+        for _ in range(replica_counts[eid]):
+            replicas.append((slot_load, eid))
+    replicas.sort(key=lambda x: -x[0])
+
+    rank_heap = [(0.0, rid) for rid in range(num_groups)]
+    heapq.heapify(rank_heap)
+    rank_experts = [[] for _ in range(num_groups)]
+    for slot_load, eid in replicas:
+        cur_load, rid = heapq.heappop(rank_heap)
+        rank_experts[rid].append(eid)
+        heapq.heappush(rank_heap, (cur_load + slot_load, rid))
+
+    if num_groups <= 1:
+        return rank_experts, replica_counts
+
+    # Load matrix: per-step per-expert load after replication split
+    load_matrix = counts_matrix / replica_counts[np.newaxis, :]  # (k, n)
+
+    # Precompute per-step per-group loads: (k, num_groups)
+    gl = np.zeros((k, num_groups))
+    for g in range(num_groups):
+        if rank_experts[g]:
+            gl[:, g] = load_matrix[:, rank_experts[g]].sum(axis=1)
+
+    best_obj = gl.max(axis=1).sum()
+
+    # Step 3: Hill-climb — pairwise swaps between ranks
+    improved = True
+    while improved:
+        improved = False
+        for g1 in range(num_groups):
+            for g2 in range(g1 + 1, num_groups):
+                # Max of all groups except g1, g2
+                mask = np.ones(num_groups, dtype=bool)
+                mask[g1] = mask[g2] = False
+                other_max = gl[:, mask].max(axis=1)
+
+                for i1 in range(len(rank_experts[g1])):
+                    for i2 in range(len(rank_experts[g2])):
+                        e1 = rank_experts[g1][i1]
+                        e2 = rank_experts[g2][i2]
+                        delta = load_matrix[:, e2] - load_matrix[:, e1]  # (k,)
+                        new_g1 = gl[:, g1] + delta
+                        new_g2 = gl[:, g2] - delta
+                        new_max = np.maximum(np.maximum(new_g1, new_g2), other_max)
+                        new_obj = new_max.sum()
+                        if new_obj < best_obj - 1e-9:
+                            rank_experts[g1][i1] = e2
+                            rank_experts[g2][i2] = e1
+                            gl[:, g1] = new_g1
+                            gl[:, g2] = new_g2
+                            best_obj = new_obj
+                            improved = True
+                            other_max = gl[:, mask].max(axis=1)
+
+    return rank_experts, replica_counts
+
+
+def eplb_replica_placement_window_min_act(per_step_counts, num_groups=None, slots_per_rank=None):
+    """EPLB placement minimizing per-rank active expert count over a window.
+
+    Objective: minimize Σ_t max_g |{e ∈ rank_g : counts[t][e] > 0}|
+    i.e. at each step the rank with the most active experts is the bottleneck;
+    minimize this bottleneck summed over the window.
+
+    Same replication and initial LPT placement, then hill-climb with
+    swap evaluations using a binary activity matrix.
+    """
+    n = len(per_step_counts[0])
+    k = len(per_step_counts)
+    if num_groups is None:
+        num_groups = max(1, int(np.sqrt(n)))
+    if slots_per_rank is None:
+        slots_per_rank = (n + num_groups - 1) // num_groups
+
+    counts_matrix = np.array(per_step_counts, dtype=np.float64)
+    agg = counts_matrix.sum(axis=0)
+
+    # Step 1: Replication — greedy on aggregate (same as load-balance variant)
+    total_slots = num_groups * slots_per_rank
+    replica_counts = np.ones(n, dtype=int)
+    if total_slots > n:
+        heap = [(-float(agg[i]), i) for i in range(n)]
+        heapq.heapify(heap)
+        assigned = n
+        while assigned < total_slots:
+            neg_load, eid = heapq.heappop(heap)
+            replica_counts[eid] += 1
+            heapq.heappush(heap, (-float(agg[eid]) / replica_counts[eid], eid))
+            assigned += 1
+
+    # Step 2: Initial placement via LPT on aggregate
+    replicas = []
+    for eid in range(n):
+        slot_load = float(agg[eid]) / replica_counts[eid]
+        for _ in range(replica_counts[eid]):
+            replicas.append((slot_load, eid))
+    replicas.sort(key=lambda x: -x[0])
+
+    rank_heap = [(0.0, rid) for rid in range(num_groups)]
+    heapq.heapify(rank_heap)
+    rank_experts = [[] for _ in range(num_groups)]
+    for slot_load, eid in replicas:
+        cur_load, rid = heapq.heappop(rank_heap)
+        rank_experts[rid].append(eid)
+        heapq.heappush(rank_heap, (cur_load + slot_load, rid))
+
+    if num_groups <= 1:
+        return rank_experts, replica_counts
+
+    # Activity matrix: binary (k, n)
+    act = (counts_matrix > 0).astype(np.float64)
+
+    # Per-step per-group active counts: (k, num_groups)
+    ga = np.zeros((k, num_groups))
+    for g in range(num_groups):
+        if rank_experts[g]:
+            ga[:, g] = act[:, rank_experts[g]].sum(axis=1)
+
+    best_obj = ga.max(axis=1).sum()
+
+    # Step 3: Hill-climb — pairwise swaps
+    improved = True
+    while improved:
+        improved = False
+        for g1 in range(num_groups):
+            for g2 in range(g1 + 1, num_groups):
+                mask = np.ones(num_groups, dtype=bool)
+                mask[g1] = mask[g2] = False
+                other_max = ga[:, mask].max(axis=1)
+
+                for i1 in range(len(rank_experts[g1])):
+                    for i2 in range(len(rank_experts[g2])):
+                        e1 = rank_experts[g1][i1]
+                        e2 = rank_experts[g2][i2]
+                        delta = act[:, e2] - act[:, e1]  # (k,)
+                        new_g1 = ga[:, g1] + delta
+                        new_g2 = ga[:, g2] - delta
+                        new_max = np.maximum(np.maximum(new_g1, new_g2), other_max)
+                        new_obj = new_max.sum()
+                        if new_obj < best_obj - 1e-9:
+                            rank_experts[g1][i1] = e2
+                            rank_experts[g2][i2] = e1
+                            ga[:, g1] = new_g1
+                            ga[:, g2] = new_g2
+                            best_obj = new_obj
+                            improved = True
+                            other_max = ga[:, mask].max(axis=1)
+
+    return rank_experts, replica_counts
+
+
 # ──────────────────────────────────────────────────────────
 # Plotting helpers
 # ──────────────────────────────────────────────────────────
@@ -206,114 +432,141 @@ def _compute_init_placement(pre_records, n_experts, num_groups, epg, slots_per_r
     return rk_experts, rk_replicas, agg
 
 
-def _simulate_no_eplb(filtered_records, n_experts, num_groups, t_coeff):
+def _simulate_no_eplb(filtered_records, n_experts, num_groups, latency_fn):
     """No EPLB: identity permutation throughout."""
     identity = np.arange(n_experts)
+    epg = (n_experts + num_groups - 1) // num_groups
+    identity_ranks = [list(range(g * epg, min((g + 1) * epg, n_experts)))
+                      for g in range(num_groups)]
     n = len(filtered_records)
     time_arr = np.zeros(n)
     util_arr = np.zeros(n)
+    max_load_arr = np.zeros(n)
     for i, r in enumerate(filtered_records):
         gl = compute_group_loads(r["counts"], identity, num_groups)
         max_l, mean_l = gl.max(), gl.mean()
-        time_arr[i] = max_l * t_coeff
+        max_load_arr[i] = max_l
         util_arr[i] = mean_l / max_l if max_l > 0 else 1.0
-    return time_arr, util_arr
+        ac = compute_rank_active_counts(r["counts"], identity_ranks)
+        time_arr[i] = max(latency_fn(a) for a in ac)
+    return time_arr, util_arr, max_load_arr
 
 
-def _simulate_static_eplb(filtered_records, t_coeff, rk_experts, rk_replicas):
+def _simulate_static_eplb(filtered_records, latency_fn, rk_experts, rk_replicas):
     """Static EPLB: fixed placement from pre-window stats, never re-adjusted."""
     n = len(filtered_records)
     time_arr = np.zeros(n)
     util_arr = np.zeros(n)
+    max_load_arr = np.zeros(n)
     for i, r in enumerate(filtered_records):
         gl = compute_group_loads_replica(r["counts"], rk_experts, rk_replicas)
         max_l, mean_l = gl.max(), gl.mean()
-        time_arr[i] = max_l * t_coeff
+        max_load_arr[i] = max_l
         util_arr[i] = mean_l / max_l if max_l > 0 else 1.0
-    return time_arr, util_arr
+        ac = compute_rank_active_counts(r["counts"], rk_experts)
+        time_arr[i] = max(latency_fn(a) for a in ac)
+    return time_arr, util_arr, max_load_arr
 
 
 def _simulate_dynamic_eplb(filtered_records, eplb_interval, n_experts, num_groups,
-                            slots_per_rank, t_coeff,
-                            init_rk_experts, init_rk_replicas, init_ema):
-    """Dynamic EPLB: starts from init placement (pre-window), re-adjusts every k steps."""
+                            slots_per_rank, latency_fn,
+                            init_rk_experts, init_rk_replicas, init_ema,
+                            placement_fn=None):
+    """Dynamic EPLB (oracle): every k steps, uses future window-optimized placement.
+
+    placement_fn: callable(per_step_counts, num_groups, slots_per_rank) -> (rk_experts, rk_replicas).
+                  Defaults to eplb_replica_placement_window (load-balance).
+    """
+    if placement_fn is None:
+        placement_fn = eplb_replica_placement_window
     n = len(filtered_records)
     time_arr = np.zeros(n)
     util_arr = np.zeros(n)
-    window_acc = np.zeros(n_experts, dtype=np.float64)
+    max_load_arr = np.zeros(n)
     rk_experts = [list(g) for g in init_rk_experts]
     rk_replicas = init_rk_replicas.copy()
-    ema_history = init_ema.copy() if init_ema is not None and init_ema.sum() > 0 else None
 
     for i, r in enumerate(filtered_records):
-        counts = r["counts"]
-        window_acc += counts
-        if i > 0 and i % eplb_interval == 0:
-            if ema_history is None:
-                ema_history = window_acc.copy()
-            else:
-                ema_history = EMA_DECAY * ema_history + (1 - EMA_DECAY) * window_acc
-            rk_experts, rk_replicas = eplb_replica_placement(ema_history, num_groups, slots_per_rank)
-            window_acc[:] = 0
-        gl = compute_group_loads_replica(counts, rk_experts, rk_replicas)
+        if i % eplb_interval == 0:
+            future_end = min(i + eplb_interval, n)
+            window_counts = [filtered_records[j]["counts"] for j in range(i, future_end)]
+            rk_experts, rk_replicas = placement_fn(
+                window_counts, num_groups, slots_per_rank)
+        gl = compute_group_loads_replica(r["counts"], rk_experts, rk_replicas)
         max_l, mean_l = gl.max(), gl.mean()
-        time_arr[i] = max_l * t_coeff
+        max_load_arr[i] = max_l
         util_arr[i] = mean_l / max_l if max_l > 0 else 1.0
-    return time_arr, util_arr
+        ac = compute_rank_active_counts(r["counts"], rk_experts)
+        time_arr[i] = max(latency_fn(a) for a in ac)
+    return time_arr, util_arr, max_load_arr
+
+
+def _compute_simulations(filtered, pre_filtered):
+    """Compute all simulations for one (layer, filter_mode). Returns dict of results."""
+    n_experts = len(filtered[0]["counts"])
+    num_groups = max(1, int(np.sqrt(n_experts)))
+    epg = (n_experts + num_groups - 1) // num_groups
+    slots_per_rank = epg + EXTRA_SLOTS_PER_RANK
+    latency_fn = load_latency_table()
+
+    init_rk, init_rep, init_agg = _compute_init_placement(
+        pre_filtered, n_experts, num_groups, epg, slots_per_rank)
+
+    no = _simulate_no_eplb(filtered, n_experts, num_groups, latency_fn)
+    st = _simulate_static_eplb(filtered, latency_fn, init_rk, init_rep)
+
+    ideal_time = np.array([latency_fn(np.sum(r["counts"] > 0) / num_groups)
+                           for r in filtered])
+    ideal_ml = np.array([r["counts"].sum() / num_groups for r in filtered])
+
+    lb, ma = {}, {}
+    for k in EPLB_INTERVALS:
+        lb[k] = _simulate_dynamic_eplb(
+            filtered, k, n_experts, num_groups,
+            slots_per_rank, latency_fn, init_rk, init_rep, init_agg)
+        ma[k] = _simulate_dynamic_eplb(
+            filtered, k, n_experts, num_groups,
+            slots_per_rank, latency_fn, init_rk, init_rep, init_agg,
+            placement_fn=eplb_replica_placement_window_min_act)
+
+    return {"no": no, "static": st, "ideal_time": ideal_time,
+            "ideal_ml": ideal_ml, "lb": lb, "ma": ma}
 
 
 # ──────────────────────────────────────────────────────────
 # Plot: EPLB comparison — No EPLB vs Static vs Dynamic (per-layer)
 # ──────────────────────────────────────────────────────────
-def plot_eplb_compare(filtered_records, pre_filtered, x_mode, filter_mode,
+def plot_eplb_compare(sim, x_vals, x_label, x_mode, filter_mode,
                       layer_idx, output_dir, eplb_interval):
     """Per-layer: No EPLB vs Static EPLB vs Dynamic EPLB(k) for one interval."""
-    if len(filtered_records) < 2:
-        return
+    no_time, no_util, no_ml = sim["no"]
+    st_time, st_util, st_ml = sim["static"]
+    dy_time, dy_util, dy_ml = sim["lb"][eplb_interval]
+    ma_time, ma_util, ma_ml = sim["ma"][eplb_interval]
+    ideal_time = sim["ideal_time"]
 
-    x_vals, x_label = get_x_values(filtered_records, x_mode)
-    n_experts = len(filtered_records[0]["counts"])
-    num_groups = max(1, int(np.sqrt(n_experts)))
-    epg = (n_experts + num_groups - 1) // num_groups
-    slots_per_rank = epg + EXTRA_SLOTS_PER_RANK
-    flops_per_token = 2 * 2 * HIDDEN_SIZE * MOE_INTERMEDIATE_SIZE
-    t_coeff = flops_per_token / (GPU_TFLOPS * 1e12) * 1000
-
-    # Initial placement from pre-window stats
-    init_rk, init_rep, init_agg = _compute_init_placement(
-        pre_filtered, n_experts, num_groups, epg, slots_per_rank)
-
-    # Three scenarios
-    no_time, no_util = _simulate_no_eplb(filtered_records, n_experts, num_groups, t_coeff)
-    st_time, st_util = _simulate_static_eplb(filtered_records, t_coeff, init_rk, init_rep)
-    dy_time, dy_util = _simulate_dynamic_eplb(
-        filtered_records, eplb_interval, n_experts, num_groups,
-        slots_per_rank, t_coeff, init_rk, init_rep, init_agg)
-    ideal_time = np.array([r["counts"].sum() / num_groups * t_coeff for r in filtered_records])
-
-    # Memory
     MB = 1024 ** 2
-    weight_per_expert = 3 * HIDDEN_SIZE * MOE_INTERMEDIATE_SIZE * 2
     activation_per_token = (HIDDEN_SIZE + 2 * MOE_INTERMEDIATE_SIZE) * 2
-    base_weight_mb = epg * weight_per_expert / MB
-    replica_weight_mb = slots_per_rank * weight_per_expert / MB
-    no_mem = no_time / t_coeff * activation_per_token / MB
-    st_mem = st_time / t_coeff * activation_per_token / MB
-    dy_mem = dy_time / t_coeff * activation_per_token / MB
-    ideal_mem = ideal_time / t_coeff * activation_per_token / MB
+    no_mem = no_ml * activation_per_token / MB
+    st_mem = st_ml * activation_per_token / MB
+    dy_mem = dy_ml * activation_per_token / MB
+    ma_mem = ma_ml * activation_per_token / MB
+    ideal_mem = sim["ideal_ml"] * activation_per_token / MB
 
     # Plot
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(16, 14), sharex=True)
     lw = 1.2
-    c_no, c_st, c_dy, c_ideal = "#e74c3c", "#3498db", "#9b59b6", "#2ecc71"
+    c_no, c_st, c_dy, c_ma, c_ideal = "#e74c3c", "#3498db", "#9b59b6", "#e67e22", "#2ecc71"
 
     ax1.plot(x_vals, no_time, label="No EPLB", color=c_no, linewidth=lw, alpha=0.8)
     ax1.plot(x_vals, st_time, label="Static EPLB", color=c_st, linewidth=lw, alpha=0.8)
-    ax1.plot(x_vals, dy_time, label=f"Dynamic EPLB (k={eplb_interval})",
+    ax1.plot(x_vals, dy_time, label=f"LoadBal (k={eplb_interval})",
              color=c_dy, linewidth=lw, alpha=0.8)
+    ax1.plot(x_vals, ma_time, label=f"MinAct (k={eplb_interval})",
+             color=c_ma, linewidth=lw, alpha=0.8)
     ax1.plot(x_vals, ideal_time, label="Ideal", color=c_ideal,
              linewidth=1.0, linestyle="--", alpha=0.6)
-    ax1.set_ylabel("MoE Time (ms)\n(2×GroupGEMM, {:.0f} TFLOPS)".format(GPU_TFLOPS), fontsize=11)
+    ax1.set_ylabel("MoE Time (ms)\n(latency lookup)", fontsize=11)
     ax1.set_title(
         make_title(f"EPLB Comparison (k={eplb_interval}, +{EXTRA_SLOTS_PER_RANK} slots)",
                    x_mode, filter_mode, layer_idx),
@@ -322,19 +575,23 @@ def plot_eplb_compare(filtered_records, pre_filtered, x_mode, filter_mode,
 
     ax2.plot(x_vals, no_util * 100, label="No EPLB", color=c_no, linewidth=lw, alpha=0.8)
     ax2.plot(x_vals, st_util * 100, label="Static EPLB", color=c_st, linewidth=lw, alpha=0.8)
-    ax2.plot(x_vals, dy_util * 100, label=f"Dynamic EPLB (k={eplb_interval})",
+    ax2.plot(x_vals, dy_util * 100, label=f"LoadBal (k={eplb_interval})",
              color=c_dy, linewidth=lw, alpha=0.8)
+    ax2.plot(x_vals, ma_util * 100, label=f"MinAct (k={eplb_interval})",
+             color=c_ma, linewidth=lw, alpha=0.8)
     ax2.axhline(y=100, color=c_ideal, linestyle="--", linewidth=1.0, alpha=0.6, label="Ideal (100%)")
     ax2.set_ylabel("Flops Utilization (%)", fontsize=11)
     ax2.set_ylim(0, 105); ax2.legend(fontsize=10); ax2.grid(True, alpha=0.3)
 
     ax3.plot(x_vals, no_mem, label="No EPLB", color=c_no, linewidth=lw, alpha=0.8)
     ax3.plot(x_vals, st_mem, label="Static EPLB", color=c_st, linewidth=lw, alpha=0.8)
-    ax3.plot(x_vals, dy_mem, label=f"Dynamic EPLB (k={eplb_interval})",
+    ax3.plot(x_vals, dy_mem, label=f"LoadBal (k={eplb_interval})",
              color=c_dy, linewidth=lw, alpha=0.8)
+    ax3.plot(x_vals, ma_mem, label=f"MinAct (k={eplb_interval})",
+             color=c_ma, linewidth=lw, alpha=0.8)
     ax3.plot(x_vals, ideal_mem, label="Ideal", color=c_ideal,
              linewidth=1.0, linestyle="--", alpha=0.6)
-    y_hi = max(no_mem.max(), st_mem.max(), dy_mem.max()) * 1.05
+    y_hi = max(no_mem.max(), st_mem.max(), dy_mem.max(), ma_mem.max()) * 1.05
     ax3.set_ylim(0, y_hi)
     ax3.set_ylabel("Activation Memory per EP Group (MB)", fontsize=11)
     ax3.set_xlabel(x_label, fontsize=12)
@@ -348,113 +605,42 @@ def plot_eplb_compare(filtered_records, pre_filtered, x_mode, filter_mode,
 # ──────────────────────────────────────────────────────────
 # Plot: System-level EPLB — No EPLB vs Static vs Dynamic
 # ──────────────────────────────────────────────────────────
-def plot_eplb_compare_system(all_records, all_pre_records, layer_indices, x_mode,
+def plot_eplb_compare_system(layer_sims, layer_indices, x_mode,
                              filter_mode, output_dir, eplb_interval):
-    """System-level EPLB: flattened (step, layer), one figure per k interval."""
-    filtered_per_layer = {}
-    pre_per_layer = {}
-    for idx in layer_indices:
-        filtered = filter_records(all_records[idx], filter_mode)
-        if len(filtered) < 2:
-            return
-        filtered_per_layer[idx] = filtered
-        pre_per_layer[idx] = filter_records(all_pre_records[idx], filter_mode)
-
-    n_steps = min(len(filtered_per_layer[idx]) for idx in layer_indices)
+    """System-level EPLB using cached per-layer simulations."""
     n_layers = len(layer_indices)
+    n_steps = min(len(layer_sims[idx]["no"][0]) for idx in layer_indices)
     total_points = n_steps * n_layers
-
-    first_layer = layer_indices[0]
-    n_experts = len(filtered_per_layer[first_layer][0]["counts"])
-    num_groups = max(1, int(np.sqrt(n_experts)))
-    epg = (n_experts + num_groups - 1) // num_groups
-    slots_per_rank = epg + EXTRA_SLOTS_PER_RANK
-    flops_per_token = 2 * 2 * HIDDEN_SIZE * MOE_INTERMEDIATE_SIZE
-    t_coeff = flops_per_token / (GPU_TFLOPS * 1e12) * 1000
     MB = 1024 ** 2
-    weight_per_expert = 3 * HIDDEN_SIZE * MOE_INTERMEDIATE_SIZE * 2
     activation_per_token = (HIDDEN_SIZE + 2 * MOE_INTERMEDIATE_SIZE) * 2
-    base_weight_mb = epg * weight_per_expert / MB
-    replica_weight_mb = slots_per_rank * weight_per_expert / MB
 
-    identity = np.arange(n_experts)
+    def _interleave(get_arr):
+        flat = np.zeros(total_points)
+        for li, idx in enumerate(layer_indices):
+            flat[li::n_layers] = get_arr(layer_sims[idx])[:n_steps]
+        return flat
+
+    no_time = _interleave(lambda s: s["no"][0])
+    no_util = _interleave(lambda s: s["no"][1])
+    no_mem = _interleave(lambda s: s["no"][2]) * activation_per_token / MB
+    st_time = _interleave(lambda s: s["static"][0])
+    st_util = _interleave(lambda s: s["static"][1])
+    st_mem = _interleave(lambda s: s["static"][2]) * activation_per_token / MB
+    dy_time = _interleave(lambda s: s["lb"][eplb_interval][0])
+    dy_util = _interleave(lambda s: s["lb"][eplb_interval][1])
+    dy_mem = _interleave(lambda s: s["lb"][eplb_interval][2]) * activation_per_token / MB
+    ma_time = _interleave(lambda s: s["ma"][eplb_interval][0])
+    ma_util = _interleave(lambda s: s["ma"][eplb_interval][1])
+    ma_mem = _interleave(lambda s: s["ma"][eplb_interval][2]) * activation_per_token / MB
+    ideal_time = _interleave(lambda s: s["ideal_time"])
+    ideal_mem = _interleave(lambda s: s["ideal_ml"]) * activation_per_token / MB
+
     x_flat = np.arange(total_points)
-
-    # Per-layer initial placement from pre-window
-    layer_init_rk, layer_init_rep, layer_init_agg = {}, {}, {}
-    for idx in layer_indices:
-        rk, rep, agg = _compute_init_placement(
-            pre_per_layer[idx], n_experts, num_groups, epg, slots_per_rank)
-        layer_init_rk[idx] = rk
-        layer_init_rep[idx] = rep
-        layer_init_agg[idx] = agg
-
-    # ---- No EPLB & Ideal ----
-    no_time = np.zeros(total_points)
-    no_util = np.zeros(total_points)
-    no_mem = np.zeros(total_points)
-    ideal_time = np.zeros(total_points)
-    ideal_mem = np.zeros(total_points)
-    for step_i in range(n_steps):
-        for li, idx in enumerate(layer_indices):
-            flat_i = step_i * n_layers + li
-            counts = filtered_per_layer[idx][step_i]["counts"]
-            gl = compute_group_loads(counts, identity, num_groups)
-            max_l, mean_l = gl.max(), gl.mean()
-            no_time[flat_i] = max_l * t_coeff
-            no_util[flat_i] = mean_l / max_l if max_l > 0 else 1.0
-            no_mem[flat_i] = max_l * activation_per_token / MB
-            il = counts.sum() / num_groups
-            ideal_time[flat_i] = il * t_coeff
-            ideal_mem[flat_i] = il * activation_per_token / MB
-
-    # ---- Static EPLB ----
-    st_time = np.zeros(total_points)
-    st_util = np.zeros(total_points)
-    for step_i in range(n_steps):
-        for li, idx in enumerate(layer_indices):
-            flat_i = step_i * n_layers + li
-            counts = filtered_per_layer[idx][step_i]["counts"]
-            gl = compute_group_loads_replica(counts, layer_init_rk[idx], layer_init_rep[idx])
-            max_l, mean_l = gl.max(), gl.mean()
-            st_time[flat_i] = max_l * t_coeff
-            st_util[flat_i] = mean_l / max_l if max_l > 0 else 1.0
-    st_mem = st_time / t_coeff * activation_per_token / MB
-
-    # ---- Dynamic EPLB ----
-    dy_time = np.zeros(total_points)
-    dy_util = np.zeros(total_points)
-    layer_window = {idx: np.zeros(n_experts, dtype=np.float64) for idx in layer_indices}
-    layer_ema = {idx: agg.copy() if agg.sum() > 0 else None
-                 for idx, agg in layer_init_agg.items()}
-    layer_rk = {idx: [list(g) for g in layer_init_rk[idx]] for idx in layer_indices}
-    layer_rep = {idx: layer_init_rep[idx].copy() for idx in layer_indices}
-
-    for step_i in range(n_steps):
-        triggered = (step_i > 0 and step_i % eplb_interval == 0)
-        if triggered:
-            for idx in layer_indices:
-                w = layer_window[idx]
-                h = layer_ema[idx]
-                layer_ema[idx] = w.copy() if h is None else EMA_DECAY * h + (1 - EMA_DECAY) * w
-                rk_e, rk_r = eplb_replica_placement(layer_ema[idx], num_groups, slots_per_rank)
-                layer_rk[idx] = rk_e
-                layer_rep[idx] = rk_r
-                layer_window[idx][:] = 0
-        for li, idx in enumerate(layer_indices):
-            flat_i = step_i * n_layers + li
-            counts = filtered_per_layer[idx][step_i]["counts"]
-            layer_window[idx] += counts
-            gl = compute_group_loads_replica(counts, layer_rk[idx], layer_rep[idx])
-            max_l, mean_l = gl.max(), gl.mean()
-            dy_time[flat_i] = max_l * t_coeff
-            dy_util[flat_i] = mean_l / max_l if max_l > 0 else 1.0
-    dy_mem = dy_time / t_coeff * activation_per_token / MB
 
     # ---- Plot ----
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(18, 14), sharex=True)
     lw = 0.8
-    c_no, c_st, c_dy, c_ideal = "#e74c3c", "#3498db", "#9b59b6", "#2ecc71"
+    c_no, c_st, c_dy, c_ma, c_ideal = "#e74c3c", "#3498db", "#9b59b6", "#e67e22", "#2ecc71"
 
     def _step_boundaries(ax):
         for s in range(1, n_steps):
@@ -467,8 +653,10 @@ def plot_eplb_compare_system(all_records, all_pre_records, layer_indices, x_mode
 
     ax1.plot(x_flat, no_time, label="No EPLB", color=c_no, linewidth=lw, alpha=0.8)
     ax1.plot(x_flat, st_time, label="Static EPLB", color=c_st, linewidth=lw, alpha=0.8)
-    ax1.plot(x_flat, dy_time, label=f"Dynamic EPLB (k={eplb_interval})",
+    ax1.plot(x_flat, dy_time, label=f"LoadBal (k={eplb_interval})",
              color=c_dy, linewidth=lw, alpha=0.8)
+    ax1.plot(x_flat, ma_time, label=f"MinAct (k={eplb_interval})",
+             color=c_ma, linewidth=lw, alpha=0.8)
     ax1.plot(x_flat, ideal_time, label="Ideal", color=c_ideal,
              linewidth=0.6, linestyle="--", alpha=0.5)
     _step_boundaries(ax1)
@@ -478,8 +666,10 @@ def plot_eplb_compare_system(all_records, all_pre_records, layer_indices, x_mode
 
     ax2.plot(x_flat, no_util * 100, label="No EPLB", color=c_no, linewidth=lw, alpha=0.8)
     ax2.plot(x_flat, st_util * 100, label="Static EPLB", color=c_st, linewidth=lw, alpha=0.8)
-    ax2.plot(x_flat, dy_util * 100, label=f"Dynamic EPLB (k={eplb_interval})",
+    ax2.plot(x_flat, dy_util * 100, label=f"LoadBal (k={eplb_interval})",
              color=c_dy, linewidth=lw, alpha=0.8)
+    ax2.plot(x_flat, ma_util * 100, label=f"MinAct (k={eplb_interval})",
+             color=c_ma, linewidth=lw, alpha=0.8)
     ax2.axhline(y=100, color=c_ideal, linestyle="--", linewidth=1.0, alpha=0.6, label="Ideal (100%)")
     _step_boundaries(ax2)
     ax2.set_ylabel("Flops Utilization (%)", fontsize=11)
@@ -487,12 +677,14 @@ def plot_eplb_compare_system(all_records, all_pre_records, layer_indices, x_mode
 
     ax3.plot(x_flat, no_mem, label="No EPLB", color=c_no, linewidth=lw, alpha=0.8)
     ax3.plot(x_flat, st_mem, label="Static EPLB", color=c_st, linewidth=lw, alpha=0.8)
-    ax3.plot(x_flat, dy_mem, label=f"Dynamic EPLB (k={eplb_interval})",
+    ax3.plot(x_flat, dy_mem, label=f"LoadBal (k={eplb_interval})",
              color=c_dy, linewidth=lw, alpha=0.8)
+    ax3.plot(x_flat, ma_mem, label=f"MinAct (k={eplb_interval})",
+             color=c_ma, linewidth=lw, alpha=0.8)
     ax3.plot(x_flat, ideal_mem, label="Ideal", color=c_ideal,
              linewidth=0.6, linestyle="--", alpha=0.5)
     _step_boundaries(ax3)
-    y_hi = max(no_mem.max(), st_mem.max(), dy_mem.max()) * 1.05
+    y_hi = max(no_mem.max(), st_mem.max(), dy_mem.max(), ma_mem.max()) * 1.05
     ax3.set_ylim(0, y_hi)
     ax3.set_ylabel("Activation Memory per EP Group (MB)", fontsize=11)
     ax3.set_xlabel(x_label, fontsize=12)
@@ -504,155 +696,29 @@ def plot_eplb_compare_system(all_records, all_pre_records, layer_indices, x_mode
 
 
 # ──────────────────────────────────────────────────────────
-# Plot: EPLB Frequency Win-Rate Comparison (per-layer)
-# ──────────────────────────────────────────────────────────
-def plot_eplb_winrate(filtered_records, pre_filtered, x_mode, filter_mode,
-                      layer_idx, output_dir):
-    """Per-layer win-rate bar chart: for each metric, which strategy wins most often."""
-    if len(filtered_records) < 2:
-        return
-
-    n_experts = len(filtered_records[0]["counts"])
-    num_groups = max(1, int(np.sqrt(n_experts)))
-    epg = (n_experts + num_groups - 1) // num_groups
-    slots_per_rank = epg + EXTRA_SLOTS_PER_RANK
-    flops_per_token = 2 * 2 * HIDDEN_SIZE * MOE_INTERMEDIATE_SIZE
-    t_coeff = flops_per_token / (GPU_TFLOPS * 1e12) * 1000
-    MB = 1024 ** 2
-    activation_per_token = (HIDDEN_SIZE + 2 * MOE_INTERMEDIATE_SIZE) * 2
-
-    # Initial placement from pre-window stats
-    init_rk, init_rep, init_agg = _compute_init_placement(
-        pre_filtered, n_experts, num_groups, epg, slots_per_rank)
-
-    # Simulate all strategies
-    no_time, no_util = _simulate_no_eplb(filtered_records, n_experts, num_groups, t_coeff)
-    st_time, st_util = _simulate_static_eplb(filtered_records, t_coeff, init_rk, init_rep)
-
-    strategy_names = ["No EPLB", "Static EPLB"]
-    all_time = [no_time, st_time]
-    all_util = [no_util, st_util]
-
-    for k in EPLB_INTERVALS:
-        dy_time, dy_util = _simulate_dynamic_eplb(
-            filtered_records, k, n_experts, num_groups,
-            slots_per_rank, t_coeff, init_rk, init_rep, init_agg)
-        strategy_names.append(f"Dynamic (k={k})")
-        all_time.append(dy_time)
-        all_util.append(dy_util)
-
-    # Compute memory from time
-    all_mem = [t / t_coeff * activation_per_token / MB for t in all_time]
-
-    n_steps = len(filtered_records)
-    n_strategies = len(strategy_names)
-
-    # Compute win counts per metric
-    # Time: lowest wins; Utilization: highest wins; Memory: lowest wins
-    time_wins = np.zeros(n_strategies)
-    util_wins = np.zeros(n_strategies)
-    mem_wins = np.zeros(n_strategies)
-
-    for i in range(n_steps):
-        time_vals = [all_time[s][i] for s in range(n_strategies)]
-        util_vals = [all_util[s][i] for s in range(n_strategies)]
-        mem_vals = [all_mem[s][i] for s in range(n_strategies)]
-
-        time_wins[np.argmin(time_vals)] += 1
-        util_wins[np.argmax(util_vals)] += 1
-        mem_wins[np.argmin(mem_vals)] += 1
-
-    # Convert to percentages
-    time_pct = time_wins / n_steps * 100
-    util_pct = util_wins / n_steps * 100
-    mem_pct = mem_wins / n_steps * 100
-
-    # Plot grouped bar chart
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 12))
-
-    # Colors for strategies
-    base_colors = ["#e74c3c", "#3498db"]  # No EPLB, Static
-    dynamic_cmap = plt.cm.Purples
-    for i, k in enumerate(EPLB_INTERVALS):
-        base_colors.append(dynamic_cmap(0.4 + 0.15 * i))
-
-    x_pos = np.arange(n_strategies)
-    bar_width = 0.6
-
-    mode_label = {"decode": "Decode Only", "prefill": "Prefill Only", "mix": "All (Mixed)"}
-
-    for ax, pct, metric_name, ylabel in [
-        (ax1, time_pct, "MoE Time", "Win Rate (%) — Lowest Time"),
-        (ax2, util_pct, "Flops Utilization", "Win Rate (%) — Highest Utilization"),
-        (ax3, mem_pct, "Activation Memory", "Win Rate (%) — Lowest Memory"),
-    ]:
-        bars = ax.bar(x_pos, pct, bar_width, color=base_colors, edgecolor="white", linewidth=0.5)
-        ax.set_ylabel(ylabel, fontsize=11)
-        ax.set_xticks(x_pos)
-        ax.set_xticklabels(strategy_names, fontsize=9, rotation=15, ha="right")
-        ax.set_ylim(0, 105)
-        ax.grid(True, alpha=0.3, axis="y")
-        # Add percentage labels on bars
-        for bar, val in zip(bars, pct):
-            if val > 0:
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
-                        f"{val:.1f}%", ha="center", va="bottom", fontsize=9, fontweight="bold")
-
-    ax1.set_title(
-        make_title(f"EPLB Win-Rate Comparison (+{EXTRA_SLOTS_PER_RANK} slots)",
-                   x_mode, filter_mode, layer_idx),
-        fontsize=14, fontweight="bold")
-
-    plt.tight_layout()
-    fname = f"eplb_winrate_{x_mode}_{filter_mode}.png"
-    savefig(fig, os.path.join(output_dir, fname))
-
-
-# ──────────────────────────────────────────────────────────
 # Plot: Dynamic vs Static EPLB — relative change statistics
 # ──────────────────────────────────────────────────────────
-def plot_eplb_dynamic_vs_static(filtered_records, pre_filtered, x_mode, filter_mode,
-                                layer_idx, output_dir):
+def plot_eplb_dynamic_vs_static(sim, x_mode, filter_mode,
+                                layer_idx, output_dir,
+                                strategy_key="lb", strategy_label="LoadBalance",
+                                fname_prefix="eplb_vs_static_loadbal"):
     """Per-layer: for each Dynamic EPLB(k), show relative change vs Static EPLB.
 
-    3 subplots (time, utilization, memory). Each subplot is a grouped bar chart:
-    - X-axis: k values from EPLB_INTERVALS
-    - Bars: mean relative change (%)
-    - Error bars: p5–p95 range
-    - Annotations: median, max improvement, max degradation
+    3 subplots (time, utilization, memory). Each subplot is a grouped bar chart.
+    Uses pre-computed simulation results from sim dict.
     """
-    if len(filtered_records) < 2:
-        return
-
-    n_experts = len(filtered_records[0]["counts"])
-    num_groups = max(1, int(np.sqrt(n_experts)))
-    epg = (n_experts + num_groups - 1) // num_groups
-    slots_per_rank = epg + EXTRA_SLOTS_PER_RANK
-    flops_per_token = 2 * 2 * HIDDEN_SIZE * MOE_INTERMEDIATE_SIZE
-    t_coeff = flops_per_token / (GPU_TFLOPS * 1e12) * 1000
+    st_time, st_util, st_ml = sim["static"]
     MB = 1024 ** 2
     activation_per_token = (HIDDEN_SIZE + 2 * MOE_INTERMEDIATE_SIZE) * 2
+    st_mem = st_ml * activation_per_token / MB
 
-    # Initial placement
-    init_rk, init_rep, init_agg = _compute_init_placement(
-        pre_filtered, n_experts, num_groups, epg, slots_per_rank)
-
-    # Static EPLB baseline
-    st_time, st_util = _simulate_static_eplb(filtered_records, t_coeff, init_rk, init_rep)
-    st_mem = st_time / t_coeff * activation_per_token / MB
-
-    # Per-k dynamic simulations — compute relative change vs static
-    k_labels = [str(k) for k in EPLB_INTERVALS]
-    # For each metric: list of arrays, one per k
-    time_rel = []  # (dynamic - static) / static * 100, negative = better
-    util_rel = []  # (dynamic - static) / static * 100, positive = better
-    mem_rel = []   # (dynamic - static) / static * 100, negative = better
+    time_rel = []
+    util_rel = []
+    mem_rel = []
 
     for k in EPLB_INTERVALS:
-        dy_time, dy_util = _simulate_dynamic_eplb(
-            filtered_records, k, n_experts, num_groups,
-            slots_per_rank, t_coeff, init_rk, init_rep, init_agg)
-        dy_mem = dy_time / t_coeff * activation_per_token / MB
+        dy_time, dy_util, dy_ml = sim[strategy_key][k]
+        dy_mem = dy_ml * activation_per_token / MB
 
         # Relative change (%), avoid div-by-zero
         safe_st_time = np.where(st_time > 0, st_time, 1e-12)
@@ -735,13 +801,13 @@ def plot_eplb_dynamic_vs_static(filtered_records, pre_filtered, x_mode, filter_m
         ax.grid(True, alpha=0.3, axis="y")
 
     ax1.set_title(
-        make_title(f"Dynamic EPLB vs Static EPLB (+{EXTRA_SLOTS_PER_RANK} slots)",
+        make_title(f"Dynamic EPLB ({strategy_label}) vs Static (+{EXTRA_SLOTS_PER_RANK} slots)",
                    x_mode, filter_mode, layer_idx),
         fontsize=14, fontweight="bold")
     ax3.set_xlabel("EPLB Re-balance Interval (k steps)", fontsize=11)
 
     plt.tight_layout()
-    fname = f"eplb_vs_static_{x_mode}_{filter_mode}.png"
+    fname = f"{fname_prefix}_{x_mode}_{filter_mode}.png"
     savefig(fig, os.path.join(output_dir, fname))
 
 
@@ -785,11 +851,11 @@ summary { cursor: pointer; font-weight: bold; font-size: 16px; color: #2c3e50; }
         layer_dir = f"layer_{idx}"
         html += f'<h2 id="layer_{idx}">Layer {idx}</h2>\n'
 
-        # Dynamic vs Static relative change
-        html += "<details open><summary>Dynamic vs Static EPLB — Relative Change</summary>\n<div class='grid'>\n"
+        # Dynamic vs Static relative change — LoadBalance
+        html += "<details open><summary>Dynamic vs Static EPLB — Relative Change (LoadBalance)</summary>\n<div class='grid'>\n"
         for x_mode in x_modes:
             for fm in filter_modes:
-                fname = f"eplb_vs_static_{x_mode}_{fm}.png"
+                fname = f"eplb_vs_static_loadbal_{x_mode}_{fm}.png"
                 fpath = f"{layer_dir}/{fname}"
                 label = f"{x_mode.title()} / {fm.title()}"
                 html += f"""<div class="card">
@@ -798,11 +864,11 @@ summary { cursor: pointer; font-weight: bold; font-size: 16px; color: #2c3e50; }
 </div>\n"""
         html += "</div></details>\n"
 
-        # Win-rate chart
-        html += "<details open><summary>Win-Rate Comparison</summary>\n<div class='grid'>\n"
+        # Dynamic vs Static relative change — MinAct
+        html += "<details open><summary>Dynamic vs Static EPLB — Relative Change (MinAct)</summary>\n<div class='grid'>\n"
         for x_mode in x_modes:
             for fm in filter_modes:
-                fname = f"eplb_winrate_{x_mode}_{fm}.png"
+                fname = f"eplb_vs_static_minact_{x_mode}_{fm}.png"
                 fpath = f"{layer_dir}/{fname}"
                 label = f"{x_mode.title()} / {fm.title()}"
                 html += f"""<div class="card">
@@ -813,7 +879,7 @@ summary { cursor: pointer; font-weight: bold; font-size: 16px; color: #2c3e50; }
 
         # Per-k comparison
         for k in EPLB_INTERVALS:
-            title = f"k={k}: No EPLB vs Static vs Dynamic"
+            title = f"k={k}: No EPLB vs Static vs LoadBal vs MinAct"
             html += f"<details open><summary>{title}</summary>\n<div class='grid'>\n"
             for x_mode in x_modes:
                 for fm in filter_modes:
@@ -828,7 +894,7 @@ summary { cursor: pointer; font-weight: bold; font-size: 16px; color: #2c3e50; }
 
     html += '<h2 id="system">System-Level</h2>\n'
     for k in EPLB_INTERVALS:
-        title = f"k={k}: No EPLB vs Static vs Dynamic (System)"
+        title = f"k={k}: No EPLB vs Static vs LoadBal vs MinAct (System)"
         html += f"<details open><summary>{title}</summary>\n<div class='grid'>\n"
         for x_mode in x_modes:
             for fm in filter_modes:
@@ -851,6 +917,48 @@ summary { cursor: pointer; font-weight: bold; font-size: 16px; color: #2c3e50; }
 # ──────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────
+def _process_layer(args):
+    """Worker: compute simulations + generate per-layer plots for one layer."""
+    layer_idx, records, pre_records, output_dir = args
+
+    layer_dir = os.path.join(output_dir, f"layer_{layer_idx}")
+    os.makedirs(layer_dir, exist_ok=True)
+
+    X_MODES = ["step"]
+    FILTER_MODES = ["decode", "prefill", "mix"]
+
+    sims = {}  # filter_mode -> sim dict
+    for filter_mode in FILTER_MODES:
+        filtered = filter_records(records, filter_mode)
+        if len(filtered) < 2:
+            continue
+        pre_filtered = filter_records(pre_records, filter_mode)
+
+        sim = _compute_simulations(filtered, pre_filtered)
+        sims[filter_mode] = sim
+
+        for x_mode in X_MODES:
+            x_vals, x_label = get_x_values(filtered, x_mode)
+
+            for k in EPLB_INTERVALS:
+                plot_eplb_compare(sim, x_vals, x_label, x_mode, filter_mode,
+                                 layer_idx, layer_dir, k)
+
+            plot_eplb_dynamic_vs_static(sim, x_mode, filter_mode,
+                                        layer_idx, layer_dir,
+                                        strategy_key="lb",
+                                        strategy_label="LoadBalance",
+                                        fname_prefix="eplb_vs_static_loadbal")
+            plot_eplb_dynamic_vs_static(sim, x_mode, filter_mode,
+                                        layer_idx, layer_dir,
+                                        strategy_key="ma",
+                                        strategy_label="MinAct",
+                                        fname_prefix="eplb_vs_static_minact")
+
+    print(f"  Layer {layer_idx} done.")
+    return layer_idx, sims
+
+
 def main():
     args = json.loads(sys.argv[1])
     exp_dir = Path(args["exp_dir"])
@@ -882,9 +990,6 @@ def main():
     print(f"Output dir: {output_dir}")
     print("=" * 60)
 
-    X_MODES = ["step"]
-    FILTER_MODES = ["decode", "prefill", "mix"]
-
     # Parse all layers — keep both window and pre-window records
     all_records = {}
     all_pre_records = {}
@@ -899,58 +1004,34 @@ def main():
             all_records[layer_idx] = full
             all_pre_records[layer_idx] = []
 
-    for layer_idx in layer_indices:
-        filepath = layer_entries[layer_idx]
-        records = all_records[layer_idx]
-        pre_records = all_pre_records[layer_idx]
+    # Process layers in parallel — each worker computes simulations + per-layer plots
+    tasks = [(idx, all_records[idx], all_pre_records[idx], str(output_dir))
+             for idx in layer_indices]
+    n_workers = min(len(layer_indices), cpu_count())
+    print(f"Processing {len(layer_indices)} layers with {n_workers} workers...")
 
-        print(f"\n{'='*60}")
-        print(f"Processing Layer {layer_idx}: {filepath}")
-        print(f"{'='*60}")
+    with Pool(n_workers) as pool:
+        results = pool.map(_process_layer, tasks)
 
-        if STEP_RANGE is not None:
-            m, n = STEP_RANGE
-            print(f"  Window [{m}, {n}): {len(records)} records, "
-                  f"pre-window: {len(pre_records)} records")
-        print(f"  Total: {len(records)} records "
-              f"({sum(1 for r in records if r['is_decode'])} decode, "
-              f"{sum(1 for r in records if not r['is_decode'])} prefill)")
+    # Collect per-layer simulations for system-level plots
+    all_sims = {layer_idx: sims for layer_idx, sims in results}
 
-        layer_dir = os.path.join(str(output_dir), f"layer_{layer_idx}")
-        os.makedirs(layer_dir, exist_ok=True)
-
-        for x_mode in X_MODES:
-            for filter_mode in FILTER_MODES:
-                filtered = filter_records(records, filter_mode)
-                if len(filtered) < 2:
-                    print(f"  [SKIP] {x_mode}/{filter_mode}: only {len(filtered)} records")
-                    continue
-                pre_filtered = filter_records(pre_records, filter_mode)
-
-                print(f"\n  --- {x_mode} / {filter_mode} ({len(filtered)} records) ---")
-
-                # EPLB comparison — per k interval
-                for k in EPLB_INTERVALS:
-                    plot_eplb_compare(filtered, pre_filtered, x_mode, filter_mode,
-                                     layer_idx, layer_dir, k)
-
-                # Win-rate comparison
-                plot_eplb_winrate(filtered, pre_filtered, x_mode, filter_mode,
-                                 layer_idx, layer_dir)
-
-                # Dynamic vs Static relative change
-                plot_eplb_dynamic_vs_static(filtered, pre_filtered, x_mode, filter_mode,
-                                            layer_idx, layer_dir)
-
-    # System-level EPLB comparison — per k interval
+    # System-level EPLB comparison — uses cached per-layer results
     print(f"\n{'='*60}")
     print(f"System-level EPLB simulation ({len(layer_indices)} layers)")
     print(f"{'='*60}")
+
+    X_MODES = ["step"]
+    FILTER_MODES = ["decode", "prefill", "mix"]
+
     for x_mode in X_MODES:
         for filter_mode in FILTER_MODES:
-            for k in EPLB_INTERVALS:
-                plot_eplb_compare_system(all_records, all_pre_records, layer_indices,
-                                        x_mode, filter_mode, str(output_dir), k)
+            if all(filter_mode in all_sims[idx] for idx in layer_indices):
+                layer_sims = {idx: all_sims[idx][filter_mode]
+                              for idx in layer_indices}
+                for k in EPLB_INTERVALS:
+                    plot_eplb_compare_system(layer_sims, layer_indices, x_mode,
+                                            filter_mode, str(output_dir), k)
 
     # Generate EPLB HTML index
     generate_eplb_index(str(output_dir), layer_indices)
