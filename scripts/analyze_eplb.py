@@ -773,9 +773,9 @@ def plot_eplb_dynamic_vs_static(sim, x_mode, filter_mode,
         p5s = np.array(p5s)
         p95s = np.array(p95s)
 
-        # Error bars: p5 to p95
-        err_low = means - p5s
-        err_high = p95s - means
+        # Error bars: p5 to p95 (clamp to non-negative)
+        err_low = np.maximum(means - p5s, 0)
+        err_high = np.maximum(p95s - means, 0)
 
         bars = ax.bar(x_pos, means, bar_width, color=colors, edgecolor="white",
                       linewidth=0.5, yerr=[err_low, err_high],
