@@ -36,8 +36,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 EPLB_INTERVALS = [1, 2, 5, 200, 1000]  # compare different EPLB intervals
 HIDDEN_SIZE = 5120
 MOE_INTERMEDIATE_SIZE = 1536
-NUM_EP_RANKS = 32  # number of EP ranks (parallelism degree)
-EXTRA_SLOTS_PER_RANK = 1  # slots_per_rank = local_experts + extra
+EP_SIZES = [8, 16, 32, 64]  # EP rank counts to sweep
+EXTRA_SLOTS_RANGE = [0, 1, 2]  # extra slots per rank to sweep
 EPMOE_LATENCY = {
     "active_experts": list(range(1, 33)),
     "latency_ms": [
@@ -319,12 +319,12 @@ def _simulate_dynamic_eplb(filtered_records, eplb_interval, n_experts, num_group
     return time_arr, util_arr, max_load_arr, mean_load_arr
 
 
-def _compute_simulations(filtered, pre_filtered):
+def _compute_simulations(filtered, pre_filtered, num_ep_ranks, extra_slots_per_rank):
     """Compute all simulations for one (layer, filter_mode). Returns dict of results."""
     n_experts = len(filtered[0]["counts"])
-    num_groups = NUM_EP_RANKS
+    num_groups = num_ep_ranks
     epg = (n_experts + num_groups - 1) // num_groups
-    slots_per_rank = epg + EXTRA_SLOTS_PER_RANK
+    slots_per_rank = epg + extra_slots_per_rank
     latency_fn = load_latency_table()
 
     init_rk, init_rep, init_agg = _compute_init_placement(
@@ -346,7 +346,8 @@ def _compute_simulations(filtered, pre_filtered):
 # Plot: EPLB comparison — No EPLB vs Static vs Dynamic (per-layer)
 # ──────────────────────────────────────────────────────────
 def plot_eplb_compare(sim, x_vals, x_label, x_mode, filter_mode,
-                      layer_idx, output_dir, eplb_interval):
+                      layer_idx, output_dir, eplb_interval,
+                      num_ep_ranks, extra_slots_per_rank):
     """Per-layer: No EPLB vs Static EPLB vs Dynamic EPLB(k) for one interval."""
     no_time, no_util, no_ml, _ = sim["no"]
     st_time, st_util, st_ml, _ = sim["static"]
@@ -369,7 +370,7 @@ def plot_eplb_compare(sim, x_vals, x_label, x_mode, filter_mode,
              color=c_dy, linewidth=lw, alpha=0.8)
     ax1.set_ylabel("MoE Time (ms)\n(latency lookup)", fontsize=11)
     ax1.set_title(
-        make_title(f"EPLB Comparison (k={eplb_interval}, +{EXTRA_SLOTS_PER_RANK} slots)",
+        make_title(f"EPLB Comparison (EP={num_ep_ranks}, k={eplb_interval}, +{extra_slots_per_rank} slots)",
                    x_mode, filter_mode, layer_idx),
         fontsize=14, fontweight="bold")
     ax1.legend(fontsize=10); ax1.grid(True, alpha=0.3)
@@ -400,7 +401,8 @@ def plot_eplb_compare(sim, x_vals, x_label, x_mode, filter_mode,
 # Plot: System-level Dynamic vs Static — relative change
 # ──────────────────────────────────────────────────────────
 def plot_system_dynamic_vs_static(layer_sims, layer_indices, x_mode,
-                                  filter_mode, output_dir):
+                                  filter_mode, output_dir,
+                                  num_ep_ranks, extra_slots_per_rank):
     """System-level relative change: Dynamic EPLB(k) vs Static EPLB.
 
     System metrics per step:
@@ -509,7 +511,7 @@ def plot_system_dynamic_vs_static(layer_sims, layer_indices, x_mode,
 
     ax1.set_title(
         f"System ({n_layers} layers) | Dynamic EPLB vs Static "
-        f"(+{EXTRA_SLOTS_PER_RANK} slots) | {mode_label[filter_mode]}",
+        f"(EP={num_ep_ranks}, +{extra_slots_per_rank} slots) | {mode_label[filter_mode]}",
         fontsize=14, fontweight="bold")
     ax3.set_xlabel("EPLB Re-balance Interval (k steps)", fontsize=11)
 
@@ -522,7 +524,8 @@ def plot_system_dynamic_vs_static(layer_sims, layer_indices, x_mode,
 # Plot: Dynamic vs Static EPLB — relative change statistics
 # ──────────────────────────────────────────────────────────
 def plot_eplb_dynamic_vs_static(sim, x_mode, filter_mode,
-                                layer_idx, output_dir):
+                                layer_idx, output_dir,
+                                num_ep_ranks, extra_slots_per_rank):
     """Per-layer: for each Dynamic EPLB(k), show relative change vs Static EPLB.
 
     3 subplots (time, utilization, memory). Each subplot is a grouped bar chart.
@@ -623,7 +626,7 @@ def plot_eplb_dynamic_vs_static(sim, x_mode, filter_mode,
         ax.grid(True, alpha=0.3, axis="y")
 
     ax1.set_title(
-        make_title(f"Dynamic EPLB vs Static (+{EXTRA_SLOTS_PER_RANK} slots)",
+        make_title(f"Dynamic EPLB vs Static (EP={num_ep_ranks}, +{extra_slots_per_rank} slots)",
                    x_mode, filter_mode, layer_idx),
         fontsize=14, fontweight="bold")
     ax3.set_xlabel("EPLB Re-balance Interval (k steps)", fontsize=11)
@@ -638,28 +641,13 @@ def plot_eplb_dynamic_vs_static(sim, x_mode, filter_mode,
 # ──────────────────────────────────────────────────────────
 def generate_eplb_index(output_root, layer_indices):
     """Generate a separate HTML index for EPLB analysis."""
-    html = """<!DOCTYPE html>
+    html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <title>EPLB Simulation Analysis</title>
-<style>
-body { font-family: 'Segoe UI', sans-serif; margin: 20px; background: #f5f5f5; }
-h1 { color: #2c3e50; border-bottom: 3px solid #9b59b6; padding-bottom: 10px; }
-h2 { color: #34495e; margin-top: 30px; }
-h3 { color: #7f8c8d; }
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 15px; }
-.card { background: white; border-radius: 8px; padding: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-.card img { width: 100%; border-radius: 4px; cursor: pointer; }
-.card img:hover { transform: scale(1.02); transition: 0.2s; }
-.card p { margin: 5px 0; font-size: 13px; color: #555; text-align: center; }
-.nav { position: sticky; top: 0; background: #2c3e50; padding: 10px 20px; border-radius: 8px; margin-bottom: 20px; }
-.nav a { color: white; margin-right: 15px; text-decoration: none; font-weight: bold; }
-.nav a:hover { color: #9b59b6; }
-details { margin: 10px 0; }
-summary { cursor: pointer; font-weight: bold; font-size: 16px; color: #2c3e50; }
-</style></head><body>
+{_HTML_STYLE}</head><body>
 <h1>EPLB Simulation Analysis</h1>
 <div class="nav">
-<a href="index.html">Main Index</a>
+<a href="../sweep_index.html">Sweep Index</a>
 """
     for idx in layer_indices:
         html += f'<a href="#layer_{idx}">Layer {idx}</a>\n'
@@ -724,9 +712,89 @@ summary { cursor: pointer; font-weight: bold; font-size: 16px; color: #2c3e50; }
 # ──────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────
+def _extract_layer_summary(sim):
+    """Extract scalar summary from per-layer simulation results.
+    Returns dict: {k: {metric_rel: {mean, p5, p95}}}."""
+    st_time, st_util, st_ml, _ = sim["static"]
+    MB = 1024 ** 2
+    activation_per_token = (HIDDEN_SIZE + 2 * MOE_INTERMEDIATE_SIZE) * 2
+    st_mem = st_ml * activation_per_token / MB
+
+    def _s(arr):
+        return {"mean": float(np.mean(arr)), "p5": float(np.percentile(arr, 5)),
+                "p95": float(np.percentile(arr, 95))}
+
+    safe_t = np.where(st_time > 0, st_time, 1e-12)
+    safe_u = np.where(st_util > 0, st_util, 1e-12)
+    safe_m = np.where(st_mem > 0, st_mem, 1e-12)
+
+    summary = {}
+    for k in EPLB_INTERVALS:
+        dy_time, dy_util, dy_ml, _ = sim["dynamic"][k]
+        dy_mem = dy_ml * activation_per_token / MB
+
+        t_rel = (dy_time - st_time) / safe_t * 100
+        u_rel = (dy_util - st_util) / safe_u * 100
+        m_rel = (dy_mem - st_mem) / safe_m * 100
+
+        summary[k] = {"time_rel": _s(t_rel), "util_rel": _s(u_rel), "mem_rel": _s(m_rel)}
+    return summary
+
+
+def _extract_system_summary(layer_sims, layer_indices):
+    """Extract system-level scalar summary across layers.
+    Returns dict: {k: {metric_rel: {mean, p5, p95}}}."""
+    n_steps = min(len(layer_sims[idx]["no"][0]) for idx in layer_indices)
+    MB = 1024 ** 2
+    activation_per_token = (HIDDEN_SIZE + 2 * MOE_INTERMEDIATE_SIZE) * 2
+
+    st_sys_time = np.zeros(n_steps)
+    st_sys_mem = np.zeros(n_steps)
+    st_sys_sum_mean = np.zeros(n_steps)
+    st_sys_sum_max = np.zeros(n_steps)
+    for idx in layer_indices:
+        st_time, st_util, st_ml, st_mean = layer_sims[idx]["static"]
+        st_sys_time += st_time[:n_steps]
+        st_sys_mem = np.maximum(st_sys_mem, st_ml[:n_steps])
+        st_sys_sum_mean += st_mean[:n_steps]
+        st_sys_sum_max += st_ml[:n_steps]
+    st_sys_mem_mb = st_sys_mem * activation_per_token / MB
+    st_sys_util = np.where(st_sys_sum_max > 0, st_sys_sum_mean / st_sys_sum_max, 1.0)
+
+    def _s(arr):
+        return {"mean": float(np.mean(arr)), "p5": float(np.percentile(arr, 5)),
+                "p95": float(np.percentile(arr, 95))}
+
+    safe_t = np.where(st_sys_time > 0, st_sys_time, 1e-12)
+    safe_u = np.where(st_sys_util > 0, st_sys_util, 1e-12)
+    safe_m = np.where(st_sys_mem_mb > 0, st_sys_mem_mb, 1e-12)
+
+    summary = {}
+    for k in EPLB_INTERVALS:
+        dy_sys_time = np.zeros(n_steps)
+        dy_sys_mem = np.zeros(n_steps)
+        dy_sys_sum_mean = np.zeros(n_steps)
+        dy_sys_sum_max = np.zeros(n_steps)
+        for idx in layer_indices:
+            dy_time, dy_util, dy_ml, dy_mean = layer_sims[idx]["dynamic"][k]
+            dy_sys_time += dy_time[:n_steps]
+            dy_sys_mem = np.maximum(dy_sys_mem, dy_ml[:n_steps])
+            dy_sys_sum_mean += dy_mean[:n_steps]
+            dy_sys_sum_max += dy_ml[:n_steps]
+        dy_sys_mem_mb = dy_sys_mem * activation_per_token / MB
+        dy_sys_util = np.where(dy_sys_sum_max > 0, dy_sys_sum_mean / dy_sys_sum_max, 1.0)
+
+        t_rel = (dy_sys_time - st_sys_time) / safe_t * 100
+        u_rel = (dy_sys_util - st_sys_util) / safe_u * 100
+        m_rel = (dy_sys_mem_mb - st_sys_mem_mb) / safe_m * 100
+
+        summary[k] = {"time_rel": _s(t_rel), "util_rel": _s(u_rel), "mem_rel": _s(m_rel)}
+    return summary
+
+
 def _process_layer(args):
     """Worker: compute simulations + generate per-layer plots for one layer."""
-    layer_idx, records, pre_records, output_dir = args
+    layer_idx, records, pre_records, output_dir, num_ep_ranks, extra_slots_per_rank = args
 
     layer_dir = os.path.join(output_dir, f"layer_{layer_idx}")
     os.makedirs(layer_dir, exist_ok=True)
@@ -735,29 +803,253 @@ def _process_layer(args):
     FILTER_MODES = ["decode", "prefill", "mix"]
 
     sims = {}  # filter_mode -> sim dict
+    layer_summary = {}  # filter_mode -> summary dict
     for filter_mode in FILTER_MODES:
         filtered = filter_records(records, filter_mode)
         if len(filtered) < 2:
             continue
         pre_filtered = filter_records(pre_records, filter_mode)
 
-        sim = _compute_simulations(filtered, pre_filtered)
+        sim = _compute_simulations(filtered, pre_filtered, num_ep_ranks, extra_slots_per_rank)
         sims[filter_mode] = sim
+        layer_summary[filter_mode] = _extract_layer_summary(sim)
 
         for x_mode in X_MODES:
             x_vals, x_label = get_x_values(filtered, x_mode)
 
             for k in EPLB_INTERVALS:
                 plot_eplb_compare(sim, x_vals, x_label, x_mode, filter_mode,
-                                 layer_idx, layer_dir, k)
+                                 layer_idx, layer_dir, k,
+                                 num_ep_ranks, extra_slots_per_rank)
 
             plot_eplb_dynamic_vs_static(sim, x_mode, filter_mode,
-                                        layer_idx, layer_dir)
+                                        layer_idx, layer_dir,
+                                        num_ep_ranks, extra_slots_per_rank)
 
     print(f"  Layer {layer_idx} done.")
-    return layer_idx, sims
+    return layer_idx, sims, layer_summary
 
 
+# ──────────────────────────────────────────────────────────
+# Comparison plots (across combos)
+# ──────────────────────────────────────────────────────────
+def plot_comparison_bar(combo_summaries, combos, filter_mode, layer_idx, output_dir):
+    """Per-layer comparison: grouped bar chart across combos for one filter_mode."""
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1,
+        figsize=(max(12, 2.5 * len(EPLB_INTERVALS)), 14))
+
+    n_k = len(EPLB_INTERVALS)
+    n_combos = len(combos)
+    bar_width = 0.8 / n_combos
+    x_pos = np.arange(n_k)
+
+    cmap = plt.cm.tab10
+    combo_colors = [cmap(i / max(n_combos, 1)) for i in range(n_combos)]
+
+    mode_label = {"decode": "Decode Only", "prefill": "Prefill Only", "mix": "All (Mixed)"}
+    metrics = [
+        ("time_rel", "Relative Change vs Static (%)\n(negative = faster)"),
+        ("util_rel", "Relative Change vs Static (%)\n(positive = better)"),
+        ("mem_rel", "Relative Change vs Static (%)\n(negative = less memory)"),
+    ]
+
+    for ax, (metric_key, ylabel) in zip([ax1, ax2, ax3], metrics):
+        for ci, combo in enumerate(combos):
+            summary = combo_summaries.get(combo, {})
+            layer_data = summary.get(layer_idx, {}).get(filter_mode)
+            if layer_data is None:
+                continue
+
+            means = np.array([layer_data[k][metric_key]["mean"] for k in EPLB_INTERVALS])
+            p5s = np.array([layer_data[k][metric_key]["p5"] for k in EPLB_INTERVALS])
+            p95s = np.array([layer_data[k][metric_key]["p95"] for k in EPLB_INTERVALS])
+            err_low = np.maximum(means - p5s, 0)
+            err_high = np.maximum(p95s - means, 0)
+
+            offset = (ci - (n_combos - 1) / 2) * bar_width
+            ep_size, extra = combo
+            ax.bar(x_pos + offset, means, bar_width * 0.9,
+                   color=combo_colors[ci], edgecolor="white", linewidth=0.5,
+                   yerr=[err_low, err_high], capsize=3,
+                   error_kw={"linewidth": 0.8, "color": "#555"},
+                   label=f"EP={ep_size},+{extra}")
+
+        ax.axhline(y=0, color="#999", linestyle="-", linewidth=0.8)
+        ax.set_ylabel(ylabel, fontsize=10)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels([f"k={k}" for k in EPLB_INTERVALS], fontsize=10)
+        ax.set_ylim(-100, 100)
+        ax.legend(fontsize=8, ncol=min(n_combos, 4))
+        ax.grid(True, alpha=0.3, axis="y")
+
+    ax1.set_title(
+        f"Layer {layer_idx} | Combo Comparison — Dynamic vs Static | {mode_label[filter_mode]}",
+        fontsize=14, fontweight="bold")
+    ax3.set_xlabel("EPLB Re-balance Interval (k steps)", fontsize=11)
+
+    plt.tight_layout()
+    savefig(fig, os.path.join(output_dir, f"compare_{filter_mode}.png"))
+
+
+def plot_comparison_system_bar(combo_summaries, combos, filter_mode, output_dir):
+    """System-level comparison: grouped bar chart across combos for one filter_mode."""
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1,
+        figsize=(max(12, 2.5 * len(EPLB_INTERVALS)), 14))
+
+    n_k = len(EPLB_INTERVALS)
+    n_combos = len(combos)
+    bar_width = 0.8 / n_combos
+    x_pos = np.arange(n_k)
+
+    cmap = plt.cm.tab10
+    combo_colors = [cmap(i / max(n_combos, 1)) for i in range(n_combos)]
+
+    mode_label = {"decode": "Decode Only", "prefill": "Prefill Only", "mix": "All (Mixed)"}
+    metrics = [
+        ("time_rel", "Relative Change vs Static (%)\n(negative = faster)"),
+        ("util_rel", "Relative Change vs Static (%)\n(positive = better)"),
+        ("mem_rel", "Relative Change vs Static (%)\n(negative = less memory)"),
+    ]
+
+    for ax, (metric_key, ylabel) in zip([ax1, ax2, ax3], metrics):
+        for ci, combo in enumerate(combos):
+            sys_data = combo_summaries.get(combo, {}).get("system", {}).get(filter_mode)
+            if sys_data is None:
+                continue
+
+            means = np.array([sys_data[k][metric_key]["mean"] for k in EPLB_INTERVALS])
+            p5s = np.array([sys_data[k][metric_key]["p5"] for k in EPLB_INTERVALS])
+            p95s = np.array([sys_data[k][metric_key]["p95"] for k in EPLB_INTERVALS])
+            err_low = np.maximum(means - p5s, 0)
+            err_high = np.maximum(p95s - means, 0)
+
+            offset = (ci - (n_combos - 1) / 2) * bar_width
+            ep_size, extra = combo
+            ax.bar(x_pos + offset, means, bar_width * 0.9,
+                   color=combo_colors[ci], edgecolor="white", linewidth=0.5,
+                   yerr=[err_low, err_high], capsize=3,
+                   error_kw={"linewidth": 0.8, "color": "#555"},
+                   label=f"EP={ep_size},+{extra}")
+
+        ax.axhline(y=0, color="#999", linestyle="-", linewidth=0.8)
+        ax.set_ylabel(ylabel, fontsize=10)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels([f"k={k}" for k in EPLB_INTERVALS], fontsize=10)
+        ax.set_ylim(-100, 100)
+        ax.legend(fontsize=8, ncol=min(n_combos, 4))
+        ax.grid(True, alpha=0.3, axis="y")
+
+    n_combos_label = len(combos)
+    ax1.set_title(
+        f"System | Combo Comparison — Dynamic vs Static | {mode_label[filter_mode]}",
+        fontsize=14, fontweight="bold")
+    ax3.set_xlabel("EPLB Re-balance Interval (k steps)", fontsize=11)
+
+    plt.tight_layout()
+    savefig(fig, os.path.join(output_dir, f"compare_system_{filter_mode}.png"))
+
+
+# ──────────────────────────────────────────────────────────
+# HTML generators for sweep
+# ──────────────────────────────────────────────────────────
+_HTML_STYLE = """<style>
+body { font-family: 'Segoe UI', sans-serif; margin: 20px; background: #f5f5f5; }
+h1 { color: #2c3e50; border-bottom: 3px solid #9b59b6; padding-bottom: 10px; }
+h2 { color: #34495e; margin-top: 30px; }
+h3 { color: #7f8c8d; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 15px; }
+.card { background: white; border-radius: 8px; padding: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+.card img { width: 100%; border-radius: 4px; cursor: pointer; }
+.card img:hover { transform: scale(1.02); transition: 0.2s; }
+.card p { margin: 5px 0; font-size: 13px; color: #555; text-align: center; }
+.nav { position: sticky; top: 0; background: #2c3e50; padding: 10px 20px; border-radius: 8px; margin-bottom: 20px; }
+.nav a { color: white; margin-right: 15px; text-decoration: none; font-weight: bold; }
+.nav a:hover { color: #9b59b6; }
+details { margin: 10px 0; }
+summary { cursor: pointer; font-weight: bold; font-size: 16px; color: #2c3e50; }
+</style>"""
+
+
+def generate_comparison_index(output_dir, combos, layer_indices):
+    """Generate HTML index for comparison plots."""
+    filter_modes = ["decode", "prefill", "mix"]
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>EPLB Sweep Comparison</title>
+{_HTML_STYLE}</head><body>
+<h1>EPLB Sweep Comparison</h1>
+<div class="nav">
+<a href="../sweep_index.html">Sweep Index</a>
+"""
+    for idx in layer_indices:
+        html += f'<a href="#layer_{idx}">Layer {idx}</a>\n'
+    html += '<a href="#system">System</a>\n'
+    html += "</div>\n"
+
+    combo_str = ", ".join(f"EP={ep}+{ex}" for ep, ex in combos)
+    html += f"<p>Combos: {combo_str}</p>\n"
+
+    for idx in layer_indices:
+        html += f'<h2 id="layer_{idx}">Layer {idx}</h2>\n'
+        html += "<div class='grid'>\n"
+        for fm in filter_modes:
+            fname = f"layer_{idx}/compare_{fm}.png"
+            html += f"""<div class="card">
+<a href="{fname}" target="_blank"><img src="{fname}" alt="Layer {idx} {fm}"></a>
+<p>{fm.title()}</p>
+</div>\n"""
+        html += "</div>\n"
+
+    html += '<h2 id="system">System-Level</h2>\n<div class="grid">\n'
+    for fm in filter_modes:
+        fname = f"compare_system_{fm}.png"
+        html += f"""<div class="card">
+<a href="{fname}" target="_blank"><img src="{fname}" alt="System {fm}"></a>
+<p>{fm.title()}</p>
+</div>\n"""
+    html += "</div>\n</body></html>"
+
+    path = os.path.join(output_dir, "comparison.html")
+    with open(path, "w") as f:
+        f.write(html)
+    print(f"  Saved comparison index: {path}")
+
+
+def generate_sweep_index(output_dir, combos, layer_indices):
+    """Generate top-level HTML index linking all combo results and comparison."""
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>EPLB Hyperparameter Sweep</title>
+{_HTML_STYLE}</head><body>
+<h1>EPLB Hyperparameter Sweep</h1>
+<div class="nav">
+<a href="comparison/comparison.html">Comparison</a>
+"""
+    for ep, ex in combos:
+        tag = f"ep{ep}_extra{ex}"
+        html += f'<a href="{tag}/eplb.html">EP={ep},+{ex}</a>\n'
+    html += "</div>\n"
+
+    html += "<h2>Configurations</h2>\n<ul>\n"
+    for ep, ex in combos:
+        tag = f"ep{ep}_extra{ex}"
+        html += f'<li><a href="{tag}/eplb.html">EP={ep}, extra_slots={ex}</a></li>\n'
+    html += "</ul>\n"
+
+    html += '<h2>Cross-Configuration Comparison</h2>\n'
+    html += '<p><a href="comparison/comparison.html">View comparison plots</a></p>\n'
+
+    html += "</body></html>"
+
+    path = os.path.join(output_dir, "sweep_index.html")
+    with open(path, "w") as f:
+        f.write(html)
+    print(f"  Saved sweep index: {path}")
+
+
+# ──────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────
 def main():
     args = json.loads(sys.argv[1])
     exp_dir = Path(args["exp_dir"])
@@ -784,12 +1076,14 @@ def main():
         return
 
     layer_indices = sorted(layer_entries.keys())
+    combos = [(ep, ex) for ep in EP_SIZES for ex in EXTRA_SLOTS_RANGE]
     print(f"Found {len(layer_indices)} layer inputs: {['layer_' + str(i) for i in layer_indices]}")
     print(f"EPLB intervals: {EPLB_INTERVALS}")
+    print(f"Sweep combos: {combos}")
     print(f"Output dir: {output_dir}")
     print("=" * 60)
 
-    # Parse all layers — keep both window and pre-window records
+    # Parse all layers once — shared across all combos
     all_records = {}
     all_pre_records = {}
     for layer_idx in layer_indices:
@@ -803,36 +1097,92 @@ def main():
             all_records[layer_idx] = full
             all_pre_records[layer_idx] = []
 
-    # Process layers in parallel — each worker computes simulations + per-layer plots
-    tasks = [(idx, all_records[idx], all_pre_records[idx], str(output_dir))
-             for idx in layer_indices]
-    n_workers = min(len(layer_indices), cpu_count())
-    print(f"Processing {len(layer_indices)} layers with {n_workers} workers...")
-
-    with Pool(n_workers) as pool:
-        results = pool.map(_process_layer, tasks)
-
-    # Collect per-layer simulations for system-level plots
-    all_sims = {layer_idx: sims for layer_idx, sims in results}
-
-    # System-level EPLB comparison — uses cached per-layer results
-    print(f"\n{'='*60}")
-    print(f"System-level EPLB simulation ({len(layer_indices)} layers)")
-    print(f"{'='*60}")
+    # Detect n_experts from first layer for latency warnings
+    first_layer = layer_indices[0]
+    n_experts = len(all_records[first_layer][0]["counts"])
+    latency_max = max(EPMOE_LATENCY["active_experts"])
 
     X_MODES = ["step"]
     FILTER_MODES = ["decode", "prefill", "mix"]
+    n_workers = min(len(layer_indices), cpu_count())
 
-    for x_mode in X_MODES:
-        for filter_mode in FILTER_MODES:
-            if all(filter_mode in all_sims[idx] for idx in layer_indices):
-                layer_sims = {idx: all_sims[idx][filter_mode]
-                              for idx in layer_indices}
-                plot_system_dynamic_vs_static(layer_sims, layer_indices, x_mode,
-                                             filter_mode, str(output_dir))
+    combo_summaries = {}  # (ep, ex) -> {layer_idx: {fm: summary}, "system": {fm: summary}}
 
-    # Generate EPLB HTML index
-    generate_eplb_index(str(output_dir), layer_indices)
+    for ep_size, extra_slots in combos:
+        combo_tag = f"ep{ep_size}_extra{extra_slots}"
+        combo_dir = str(output_dir / combo_tag)
+        os.makedirs(combo_dir, exist_ok=True)
+
+        epg = (n_experts + ep_size - 1) // ep_size
+        slots = epg + extra_slots
+        if slots > latency_max:
+            print(f"  WARNING: {combo_tag} has slots_per_rank={slots} > latency table max={latency_max}. "
+                  f"Latency will be clamped.")
+
+        print(f"\n{'='*60}")
+        print(f"Combo: EP={ep_size}, extra_slots={extra_slots} ({combo_tag})")
+        print(f"  experts_per_group={epg}, slots_per_rank={slots}")
+        print(f"{'='*60}")
+
+        # Per-layer: parallel processing
+        tasks = [(idx, all_records[idx], all_pre_records[idx], combo_dir,
+                  ep_size, extra_slots) for idx in layer_indices]
+        print(f"Processing {len(layer_indices)} layers with {n_workers} workers...")
+
+        with Pool(n_workers) as pool:
+            results = pool.map(_process_layer, tasks)
+
+        # Collect sims and summaries
+        all_sims = {}
+        layer_summaries = {}
+        for layer_idx, sims, layer_summary in results:
+            all_sims[layer_idx] = sims
+            layer_summaries[layer_idx] = layer_summary
+
+        # System-level plots
+        print(f"  System-level plots...")
+        system_summary = {}
+        for x_mode in X_MODES:
+            for filter_mode in FILTER_MODES:
+                if all(filter_mode in all_sims[idx] for idx in layer_indices):
+                    layer_sims = {idx: all_sims[idx][filter_mode]
+                                  for idx in layer_indices}
+                    plot_system_dynamic_vs_static(layer_sims, layer_indices, x_mode,
+                                                 filter_mode, combo_dir,
+                                                 ep_size, extra_slots)
+                    if filter_mode not in system_summary:
+                        system_summary[filter_mode] = _extract_system_summary(
+                            layer_sims, layer_indices)
+
+        # Per-combo HTML index
+        generate_eplb_index(combo_dir, layer_indices)
+
+        # Store scalar summary, release large arrays
+        combo_summaries[(ep_size, extra_slots)] = {**layer_summaries, "system": system_summary}
+        del all_sims, results
+        print(f"  {combo_tag} done.")
+
+    # ── Comparison plots ──
+    print(f"\n{'='*60}")
+    print(f"Generating comparison plots...")
+    print(f"{'='*60}")
+
+    comp_dir = str(output_dir / "comparison")
+    os.makedirs(comp_dir, exist_ok=True)
+
+    for filter_mode in FILTER_MODES:
+        # Per-layer comparison
+        for idx in layer_indices:
+            layer_comp_dir = os.path.join(comp_dir, f"layer_{idx}")
+            os.makedirs(layer_comp_dir, exist_ok=True)
+            plot_comparison_bar(combo_summaries, combos, filter_mode, idx, layer_comp_dir)
+
+        # System-level comparison
+        plot_comparison_system_bar(combo_summaries, combos, filter_mode, comp_dir)
+
+    generate_comparison_index(comp_dir, combos, layer_indices)
+    generate_sweep_index(str(output_dir), combos, layer_indices)
+
     print(f"\n{'='*60}")
     print(f"完成: {output_dir}")
     print(f"{'='*60}")
