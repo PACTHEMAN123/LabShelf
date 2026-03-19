@@ -168,8 +168,10 @@ def cmd_add_data(args):
     logical_name = args.name if args.name else src.stem
     dest = exp_dir / "data" / src.name
 
-    # 拷贝文件或文件夹
-    if src.is_dir():
+    # 防止源和目标是同一路径（原地 add-data 会导致数据被删除）
+    if src == dest:
+        print(f"源文件已在目标位置，跳过拷贝: {dest}")
+    elif src.is_dir():
         if dest.exists():
             shutil.rmtree(str(dest))
         shutil.copytree(str(src), str(dest))

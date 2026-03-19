@@ -38,15 +38,6 @@ HIDDEN_SIZE = 5120
 MOE_INTERMEDIATE_SIZE = 1536
 EP_SIZES = [8, 16, 32, 64]  # EP rank counts to sweep
 EXTRA_SLOTS_RANGE = [0, 1, 2]  # extra slots per rank to sweep
-EPMOE_LATENCY = {
-    "active_experts": list(range(1, 33)),
-    "latency_ms": [
-        0.327536,0.328576,0.329600,0.327296,0.354256,0.33784,0.329968,0.325616,
-        0.326016,0.363072,0.405536,0.411616,0.433280,0.480448,0.516096,0.508736,
-        0.549792,0.542576,0.575744,0.634432,0.637968,0.652320,0.691952,0.687616,
-        0.719296,0.741088,0.743392,0.840064,0.8702912,0.827024,0.862720,0.913840
-    ],
-}
 STEP_RANGE = (1000, 10000)  # (m, n) 只取第 m~n 条记录，None 表示全部
 # STEP_RANGE = None
 
@@ -98,20 +89,7 @@ def filter_records(records, mode):
 # ──────────────────────────────────────────────────────────
 # Metrics / helpers
 # ──────────────────────────────────────────────────────────
-def compute_group_loads(counts, permutation, num_groups=None):
-    """Compute per-group token loads given expert counts and permutation."""
-    n = len(counts)
-    if num_groups is None:
-        num_groups = max(1, int(np.sqrt(n)))
-    group_loads = np.zeros(num_groups)
-    group_size = (n + num_groups - 1) // num_groups
-    for expert_idx in range(n):
-        group_id = min(permutation[expert_idx] // group_size, num_groups - 1)
-        group_loads[group_id] += counts[expert_idx]
-    return group_loads
-
-
-def eplb_replica_placement(counts, num_groups=None, slots_per_rank=None):
+def eplb_replica_placement(counts, num_groups, slots_per_rank):
     """EPLB with expert replication + greedy LPT placement.
 
     Step 1 (Replication): greedily assign extra slots to highest per-replica load experts.
@@ -122,10 +100,6 @@ def eplb_replica_placement(counts, num_groups=None, slots_per_rank=None):
       replica_counts: array[n] — number of replicas per expert
     """
     n = len(counts)
-    if num_groups is None:
-        num_groups = max(1, int(np.sqrt(n)))
-    if slots_per_rank is None:
-        slots_per_rank = (n + num_groups - 1) // num_groups
 
     total_slots = num_groups * slots_per_rank
     replica_counts = np.ones(n, dtype=int)
@@ -181,17 +155,34 @@ def compute_group_loads_replica(counts, rank_experts, replica_counts):
     return group_loads
 
 
-def load_latency_table():
-    """Return an interpolation function: active_experts -> latency_ms from hardcoded data."""
-    xs = np.array(EPMOE_LATENCY["active_experts"], dtype=float)
-    ys = np.array(EPMOE_LATENCY["latency_ms"], dtype=float)
+def load_latency_table(json_path):
+    """Return a lookup function: (n_active_experts, batch_size) -> latency_ms.
 
-    def latency_fn(n_active):
-        if n_active <= 0:
+    JSON format: {"active_experts": [1..32], "batch_sizes": [...], "latency_ms": [[...]]}
+    where latency_ms has shape (len(active_experts), len(batch_sizes)).
+
+    n_active_experts is an integer 1-32, used as direct row index (no interpolation).
+    batch_size is interpolated piecewise-linearly along each row, with linear
+    extrapolation beyond the profiled range.
+    """
+    with open(json_path) as f:
+        data = json.load(f)
+    batch_sizes = np.array(data["batch_sizes"], dtype=float)
+    latency_ms = np.array(data["latency_ms"], dtype=float)
+    row_map = {int(ae): i for i, ae in enumerate(data["active_experts"])}
+
+    def latency_fn(n_active, batch_size):
+        if n_active <= 0 or batch_size <= 0:
             return 0.0
-        if n_active >= xs[-1]:
-            return float(ys[-1])
-        return float(np.interp(n_active, xs, ys))
+        row = latency_ms[row_map[int(n_active)]]
+        bs = float(batch_size)
+        if bs <= batch_sizes[0]:
+            slope = (row[1] - row[0]) / (batch_sizes[1] - batch_sizes[0])
+            return float(row[0] + slope * (bs - batch_sizes[0]))
+        if bs >= batch_sizes[-1]:
+            slope = (row[-1] - row[-2]) / (batch_sizes[-1] - batch_sizes[-2])
+            return float(row[-1] + slope * (bs - batch_sizes[-1]))
+        return float(np.interp(bs, batch_sizes, row))
     return latency_fn
 
 
@@ -249,60 +240,24 @@ def _compute_init_placement(pre_records, n_experts, num_groups, epg, slots_per_r
     return rk_experts, rk_replicas, agg
 
 
-def _simulate_no_eplb(filtered_records, n_experts, num_groups, latency_fn):
-    """No EPLB: identity permutation throughout."""
-    identity = np.arange(n_experts)
-    epg = (n_experts + num_groups - 1) // num_groups
-    identity_ranks = [list(range(g * epg, min((g + 1) * epg, n_experts)))
-                      for g in range(num_groups)]
+def _simulate(filtered_records, latency_fn, rk_experts, rk_replicas,
+              n_experts=None, num_groups=None, slots_per_rank=None, eplb_interval=None):
+    """Unified EPLB simulation.
+
+    eplb_interval=None → static (fixed placement).
+    eplb_interval=N   → dynamic (re-balance every N steps).
+    For no-EPLB, pass identity placement with eplb_interval=None.
+    """
     n = len(filtered_records)
     time_arr = np.zeros(n)
     util_arr = np.zeros(n)
     max_load_arr = np.zeros(n)
     mean_load_arr = np.zeros(n)
-    for i, r in enumerate(filtered_records):
-        gl = compute_group_loads(r["counts"], identity, num_groups)
-        max_l, mean_l = gl.max(), gl.mean()
-        max_load_arr[i] = max_l
-        mean_load_arr[i] = mean_l
-        util_arr[i] = mean_l / max_l if max_l > 0 else 1.0
-        ac = compute_rank_active_counts(r["counts"], identity_ranks)
-        time_arr[i] = max(latency_fn(a) for a in ac)
-    return time_arr, util_arr, max_load_arr, mean_load_arr
-
-
-def _simulate_static_eplb(filtered_records, latency_fn, rk_experts, rk_replicas):
-    """Static EPLB: fixed placement from pre-window stats, never re-adjusted."""
-    n = len(filtered_records)
-    time_arr = np.zeros(n)
-    util_arr = np.zeros(n)
-    max_load_arr = np.zeros(n)
-    mean_load_arr = np.zeros(n)
-    for i, r in enumerate(filtered_records):
-        gl = compute_group_loads_replica(r["counts"], rk_experts, rk_replicas)
-        max_l, mean_l = gl.max(), gl.mean()
-        max_load_arr[i] = max_l
-        mean_load_arr[i] = mean_l
-        util_arr[i] = mean_l / max_l if max_l > 0 else 1.0
-        ac = compute_rank_active_counts(r["counts"], rk_experts)
-        time_arr[i] = max(latency_fn(a) for a in ac)
-    return time_arr, util_arr, max_load_arr, mean_load_arr
-
-
-def _simulate_dynamic_eplb(filtered_records, eplb_interval, n_experts, num_groups,
-                            slots_per_rank, latency_fn,
-                            init_rk_experts, init_rk_replicas):
-    """Dynamic EPLB: every k steps, aggregate future window and run greedy EPLB."""
-    n = len(filtered_records)
-    time_arr = np.zeros(n)
-    util_arr = np.zeros(n)
-    max_load_arr = np.zeros(n)
-    mean_load_arr = np.zeros(n)
-    rk_experts = [list(g) for g in init_rk_experts]
-    rk_replicas = init_rk_replicas.copy()
+    rk_experts = [list(g) for g in rk_experts]
+    rk_replicas = rk_replicas.copy()
 
     for i, r in enumerate(filtered_records):
-        if i % eplb_interval == 0:
+        if eplb_interval and i % eplb_interval == 0:
             future_end = min(i + eplb_interval, n)
             agg = np.zeros(n_experts, dtype=np.float64)
             for j in range(i, future_end):
@@ -315,29 +270,30 @@ def _simulate_dynamic_eplb(filtered_records, eplb_interval, n_experts, num_group
         mean_load_arr[i] = mean_l
         util_arr[i] = mean_l / max_l if max_l > 0 else 1.0
         ac = compute_rank_active_counts(r["counts"], rk_experts)
-        time_arr[i] = max(latency_fn(a) for a in ac)
+        time_arr[i] = max(latency_fn(int(ac[g]), float(gl[g]))
+                          for g in range(len(rk_experts)))
     return time_arr, util_arr, max_load_arr, mean_load_arr
 
 
-def _compute_simulations(filtered, pre_filtered, num_ep_ranks, extra_slots_per_rank):
+def _compute_simulations(filtered, pre_filtered, num_ep_ranks, extra_slots_per_rank, latency_fn):
     """Compute all simulations for one (layer, filter_mode). Returns dict of results."""
     n_experts = len(filtered[0]["counts"])
-    num_groups = num_ep_ranks
-    epg = (n_experts + num_groups - 1) // num_groups
+    epg = (n_experts + num_ep_ranks - 1) // num_ep_ranks
     slots_per_rank = epg + extra_slots_per_rank
-    latency_fn = load_latency_table()
 
-    init_rk, init_rep, init_agg = _compute_init_placement(
-        pre_filtered, n_experts, num_groups, epg, slots_per_rank)
+    # Identity placement for no-EPLB
+    identity_ranks = [list(range(g * epg, min((g + 1) * epg, n_experts)))
+                      for g in range(num_ep_ranks)]
+    identity_replicas = np.ones(n_experts, dtype=int)
 
-    no = _simulate_no_eplb(filtered, n_experts, num_groups, latency_fn)
-    st = _simulate_static_eplb(filtered, latency_fn, init_rk, init_rep)
+    init_rk, init_rep, _ = _compute_init_placement(
+        pre_filtered, n_experts, num_ep_ranks, epg, slots_per_rank)
 
-    dy = {}
-    for k in EPLB_INTERVALS:
-        dy[k] = _simulate_dynamic_eplb(
-            filtered, k, n_experts, num_groups,
-            slots_per_rank, latency_fn, init_rk, init_rep)
+    no = _simulate(filtered, latency_fn, identity_ranks, identity_replicas)
+    st = _simulate(filtered, latency_fn, init_rk, init_rep)
+    dy = {k: _simulate(filtered, latency_fn, init_rk, init_rep,
+                        n_experts, num_ep_ranks, slots_per_rank, k)
+          for k in EPLB_INTERVALS}
 
     return {"no": no, "static": st, "dynamic": dy}
 
@@ -793,38 +749,23 @@ def _extract_system_summary(layer_sims, layer_indices):
 
 
 def _process_layer(args):
-    """Worker: compute simulations + generate per-layer plots for one layer."""
-    layer_idx, records, pre_records, output_dir, num_ep_ranks, extra_slots_per_rank = args
+    """Worker: compute simulations for one layer (plotting skipped in sweep mode)."""
+    layer_idx, records, pre_records, num_ep_ranks, extra_slots_per_rank, latency_json_path = args
 
-    layer_dir = os.path.join(output_dir, f"layer_{layer_idx}")
-    os.makedirs(layer_dir, exist_ok=True)
-
-    X_MODES = ["step"]
+    latency_fn = load_latency_table(latency_json_path)
     FILTER_MODES = ["decode", "prefill", "mix"]
 
-    sims = {}  # filter_mode -> sim dict
-    layer_summary = {}  # filter_mode -> summary dict
+    sims = {}
+    layer_summary = {}
     for filter_mode in FILTER_MODES:
         filtered = filter_records(records, filter_mode)
         if len(filtered) < 2:
             continue
         pre_filtered = filter_records(pre_records, filter_mode)
 
-        sim = _compute_simulations(filtered, pre_filtered, num_ep_ranks, extra_slots_per_rank)
+        sim = _compute_simulations(filtered, pre_filtered, num_ep_ranks, extra_slots_per_rank, latency_fn)
         sims[filter_mode] = sim
         layer_summary[filter_mode] = _extract_layer_summary(sim)
-
-        for x_mode in X_MODES:
-            x_vals, x_label = get_x_values(filtered, x_mode)
-
-            for k in EPLB_INTERVALS:
-                plot_eplb_compare(sim, x_vals, x_label, x_mode, filter_mode,
-                                 layer_idx, layer_dir, k,
-                                 num_ep_ranks, extra_slots_per_rank)
-
-            plot_eplb_dynamic_vs_static(sim, x_mode, filter_mode,
-                                        layer_idx, layer_dir,
-                                        num_ep_ranks, extra_slots_per_rank)
 
     print(f"  Layer {layer_idx} done.")
     return layer_idx, sims, layer_summary
@@ -939,7 +880,6 @@ def plot_comparison_system_bar(combo_summaries, combos, filter_mode, output_dir)
         ax.legend(fontsize=8, ncol=min(n_combos, 4))
         ax.grid(True, alpha=0.3, axis="y")
 
-    n_combos_label = len(combos)
     ax1.set_title(
         f"System | Combo Comparison — Dynamic vs Static | {mode_label[filter_mode]}",
         fontsize=14, fontweight="bold")
@@ -1060,35 +1000,47 @@ def main():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True)
 
-    print(inputs)
+    # Detect trace directory (layer_*.log) and latency model (JSON) from inputs
+    trace_dir = None
+    latency_json_path = None
+    for name, path in inputs.items():
+        p = Path(path)
+        if p.is_dir() and list(p.glob("layer_*.log")):
+            trace_dir = p
+        elif p.is_file() and p.suffix == ".json":
+            latency_json_path = str(p)
+        elif p.is_dir():
+            jsons = list(p.glob("*.json"))
+            if jsons:
+                latency_json_path = str(jsons[0])
 
-    dir_path = Path(next(iter(inputs.values())))
+    if trace_dir is None:
+        sys.exit("Error: no trace directory (containing layer_*.log) found in inputs")
+    if latency_json_path is None:
+        sys.exit("Error: no latency model JSON found in inputs")
 
+    # Discover layers
     layer_entries = {}
-
-    for file in dir_path.glob("layer_*.log"):
+    for file in trace_dir.glob("layer_*.log"):
         m = re.search(r"layer[_-]?(\d+)", file.name)
         if m:
             layer_entries[int(m.group(1))] = str(file)
 
     if not layer_entries:
-        print(f"No layer files found in inputs. Available inputs: {list(inputs.keys())}")
-        return
+        sys.exit(f"No layer files found in {trace_dir}")
 
     layer_indices = sorted(layer_entries.keys())
     combos = [(ep, ex) for ep in EP_SIZES for ex in EXTRA_SLOTS_RANGE]
-    print(f"Found {len(layer_indices)} layer inputs: {['layer_' + str(i) for i in layer_indices]}")
+    print(f"Found {len(layer_indices)} layers, latency model: {latency_json_path}")
     print(f"EPLB intervals: {EPLB_INTERVALS}")
     print(f"Sweep combos: {combos}")
-    print(f"Output dir: {output_dir}")
-    print("=" * 60)
+    print(f"EP_SIZES: {EP_SIZES}, EXTRA_SLOTS_RANGE: {EXTRA_SLOTS_RANGE}")
 
     # Parse all layers once — shared across all combos
     all_records = {}
     all_pre_records = {}
     for layer_idx in layer_indices:
-        filepath = layer_entries[layer_idx]
-        full = parse_log_file(filepath)
+        full = parse_log_file(layer_entries[layer_idx])
         if STEP_RANGE is not None:
             m, n = STEP_RANGE
             all_records[layer_idx] = full[m:n]
@@ -1097,95 +1049,51 @@ def main():
             all_records[layer_idx] = full
             all_pre_records[layer_idx] = []
 
-    # Detect n_experts from first layer for latency warnings
-    first_layer = layer_indices[0]
-    n_experts = len(all_records[first_layer][0]["counts"])
-    latency_max = max(EPMOE_LATENCY["active_experts"])
-
-    X_MODES = ["step"]
     FILTER_MODES = ["decode", "prefill", "mix"]
     n_workers = min(len(layer_indices), cpu_count())
-
-    combo_summaries = {}  # (ep, ex) -> {layer_idx: {fm: summary}, "system": {fm: summary}}
+    combo_summaries = {}
 
     for ep_size, extra_slots in combos:
         combo_tag = f"ep{ep_size}_extra{extra_slots}"
-        combo_dir = str(output_dir / combo_tag)
-        os.makedirs(combo_dir, exist_ok=True)
+        print(f"\n  Simulating {combo_tag}...")
 
-        epg = (n_experts + ep_size - 1) // ep_size
-        slots = epg + extra_slots
-        if slots > latency_max:
-            print(f"  WARNING: {combo_tag} has slots_per_rank={slots} > latency table max={latency_max}. "
-                  f"Latency will be clamped.")
-
-        print(f"\n{'='*60}")
-        print(f"Combo: EP={ep_size}, extra_slots={extra_slots} ({combo_tag})")
-        print(f"  experts_per_group={epg}, slots_per_rank={slots}")
-        print(f"{'='*60}")
-
-        # Per-layer: parallel processing
-        tasks = [(idx, all_records[idx], all_pre_records[idx], combo_dir,
-                  ep_size, extra_slots) for idx in layer_indices]
-        print(f"Processing {len(layer_indices)} layers with {n_workers} workers...")
+        tasks = [(idx, all_records[idx], all_pre_records[idx],
+                  ep_size, extra_slots, latency_json_path) for idx in layer_indices]
 
         with Pool(n_workers) as pool:
             results = pool.map(_process_layer, tasks)
 
-        # Collect sims and summaries
-        all_sims = {}
         layer_summaries = {}
+        all_sims = {}
         for layer_idx, sims, layer_summary in results:
             all_sims[layer_idx] = sims
             layer_summaries[layer_idx] = layer_summary
 
-        # System-level plots
-        print(f"  System-level plots...")
         system_summary = {}
-        for x_mode in X_MODES:
-            for filter_mode in FILTER_MODES:
-                if all(filter_mode in all_sims[idx] for idx in layer_indices):
-                    layer_sims = {idx: all_sims[idx][filter_mode]
-                                  for idx in layer_indices}
-                    plot_system_dynamic_vs_static(layer_sims, layer_indices, x_mode,
-                                                 filter_mode, combo_dir,
-                                                 ep_size, extra_slots)
-                    if filter_mode not in system_summary:
-                        system_summary[filter_mode] = _extract_system_summary(
-                            layer_sims, layer_indices)
+        for filter_mode in FILTER_MODES:
+            if all(filter_mode in all_sims[idx] for idx in layer_indices):
+                layer_sims = {idx: all_sims[idx][filter_mode] for idx in layer_indices}
+                system_summary[filter_mode] = _extract_system_summary(layer_sims, layer_indices)
 
-        # Per-combo HTML index
-        generate_eplb_index(combo_dir, layer_indices)
-
-        # Store scalar summary, release large arrays
         combo_summaries[(ep_size, extra_slots)] = {**layer_summaries, "system": system_summary}
         del all_sims, results
         print(f"  {combo_tag} done.")
 
-    # ── Comparison plots ──
-    print(f"\n{'='*60}")
-    print(f"Generating comparison plots...")
-    print(f"{'='*60}")
-
+    # Comparison plots only (per-combo plots skipped)
+    print(f"\nGenerating comparison plots...")
     comp_dir = str(output_dir / "comparison")
     os.makedirs(comp_dir, exist_ok=True)
 
     for filter_mode in FILTER_MODES:
-        # Per-layer comparison
         for idx in layer_indices:
             layer_comp_dir = os.path.join(comp_dir, f"layer_{idx}")
             os.makedirs(layer_comp_dir, exist_ok=True)
             plot_comparison_bar(combo_summaries, combos, filter_mode, idx, layer_comp_dir)
-
-        # System-level comparison
         plot_comparison_system_bar(combo_summaries, combos, filter_mode, comp_dir)
 
     generate_comparison_index(comp_dir, combos, layer_indices)
-    generate_sweep_index(str(output_dir), combos, layer_indices)
 
-    print(f"\n{'='*60}")
-    print(f"完成: {output_dir}")
-    print(f"{'='*60}")
+    print(f"\n完成: {output_dir}")
 
 
 if __name__ == "__main__":
